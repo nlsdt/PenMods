@@ -66,7 +66,8 @@ Config::Config() : Logger("Config") {
                 {"screen_on", false},
                 {"restart", true},
                 {"reset_page", true},
-                {"dev_setting", false}
+                {"dev_setting", false},
+                {"filemanager",false}
             }}
         }},
         {"antiembs", {
