@@ -158,42 +158,11 @@ void ChatBot::sendMessage(const QString& message) {
 
     debug("消息总数: {}", messages.size());
 
-    // 添加用户消息到历史（注意：这是对 UI 历史的更新，不是 API 请求中的历史）
+    // 添加用户消息到历史
     m_conversationHistory.enqueue(qMakePair(QString("user"), message));
     if (m_conversationHistory.size() > MAX_HISTORY_SIZE) {
         m_conversationHistory.dequeue();
     }
-
-    makeApiRequest(messages);
-}
-
-// 发送消息（带历史记录）
-void ChatBot::sendMessageWithHistory(const QString& message, const QJsonArray& history) {
-    debug("发送消息(带历史): {}", message.toStdString());
-
-    // 构建消息数组，首先添加系统消息
-    QJsonArray messages;
-
-    // 添加系统消息
-    QJsonObject systemMsg;
-    systemMsg["role"]    = "system";
-    systemMsg["content"] = m_defaultPrompt;
-    messages.append(systemMsg);
-
-    // 添加历史消息
-    for (const auto& item : history) {
-        if (item.isObject()) {
-            messages.append(item);
-        }
-    }
-
-    // 添加当前消息
-    QJsonObject currentUserMsg;
-    currentUserMsg["role"]    = "user";
-    currentUserMsg["content"] = message;
-    messages.append(currentUserMsg);
-
-    debug("历史消息总数: {}, 总消息数: {}", history.size(), messages.size());
 
     makeApiRequest(messages);
 }

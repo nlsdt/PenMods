@@ -35,7 +35,6 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
 public:
     // 可供 QML 调用的方法
     Q_INVOKABLE void sendMessage(const QString& message);
-    Q_INVOKABLE void sendMessageWithHistory(const QString& message, const QJsonArray& history);
     Q_INVOKABLE bool isAvailable();  // 检查是否已配置必要设置
     Q_INVOKABLE void reloadConfig(); // 重载配置
     Q_INVOKABLE void clearHistory(); // 清除历史记录
