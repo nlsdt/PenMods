@@ -159,6 +159,8 @@ PEN_HOOK(bool, license_verify) { return true; }
 
 #include "hitokoto/Backend.h"
 
+#include "chatbot/Backend.h"
+
 using namespace mod;
 
 __attribute__((constructor)) static void BeforeMain() {
@@ -229,6 +231,9 @@ __attribute__((constructor)) static void BeforeMain() {
 
     // hitokoto
     INSTANCE(hitokoto::Hitokoto)
+
+    // chatbot
+    INSTANCE(chatbot::ChatBot)
 
 #undef INSTANCE
 }
