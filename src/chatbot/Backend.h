@@ -38,6 +38,7 @@ public:
     Q_INVOKABLE bool isAvailable();  // 检查是否已配置必要设置
     Q_INVOKABLE void reloadConfig(); // 重载配置
     Q_INVOKABLE void clearHistory(); // 清除历史记录
+    Q_INVOKABLE void saveMessages(); // 保存聊天记录
     Q_INVOKABLE QString markdownToHtml(const QString& markdown); // 将 Markdown 文本转换为 HTML
 
     // 设置获取器

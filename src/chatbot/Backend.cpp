@@ -10,6 +10,7 @@
 #include "common/service/Logger.h"
 #include "mod/Config.h"
 #include "mod/Mod.h"
+#include "common/Utils.h"
 
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
@@ -25,6 +26,10 @@ using json = nlohmann::json;
 #include <QTimer>
 #include <QTextDocument>
 #include <QUrl>
+#include <QDateTime>
+#include <QFile>
+#include <QTextStream>
+#include <QDir>
 
 namespace mod::chatbot {
 
@@ -44,6 +49,7 @@ QString ChatBot::markdownToHtml(const QString& markdown) {
     doc.setMarkdown(markdown);
     return doc.toHtml();
 }
+
 
 // 构造函数：初始化日志器、网络管理器，注册 QML 绑定供前端使用
 ChatBot::ChatBot()
@@ -368,6 +374,51 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
 void ChatBot::clearHistory() {
     debug("清除聊天历史记录");
     m_conversationHistory.clear();
+}
+
+// 保存聊天记录
+void ChatBot::saveMessages() {
+    // 构造默认保存目录
+    QString saveDir = "/userdisk/Music/AI/Saved";
+    QDir dir(saveDir);
+    if (!dir.exists()) {
+        dir.mkpath(saveDir); // 创建目录（如果不存在）
+    }
+
+    // 生成带时间戳的文件名
+    QString fileName = "chat_" + QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss") + ".md";
+    QString savePath = saveDir + "/" + fileName;
+
+    debug("保存聊天记录到: {}", savePath.toStdString());
+
+    QFile file(savePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        error("无法打开文件进行写入: {}", savePath.toStdString());
+        emit errorOccurred("无法保存文件: " + savePath);
+        return;
+    }
+
+    QTextStream out(&file);
+    out.setCodec("UTF-8");
+
+    // 写入 Markdown 头部
+    out << tr("# AI 聊天记录\n");
+    out << QDateTime::currentDateTime().toString("保存时间: yyyy-MM-dd hh:mm:ss") << tr("\n\n");
+
+    // 遍历历史记录并写入
+    for (const auto& pair : m_conversationHistory) {
+        if (pair.first == "user") {
+            out << tr("我：\n") << pair.second << tr("\n\n");
+        } else if (pair.first == "assistant") {
+            out << tr("AI：\n") << pair.second << tr("\n\n");
+        }
+    }
+
+    file.close();
+
+    showToast("保存成功");
+
+    info("聊天记录已成功保存到: {}", savePath.toStdString());
 }
 
 // API 密钥相关的 getter 和 setter
