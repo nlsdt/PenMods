@@ -31,6 +31,8 @@ private:
     bool _load();
 
     bool _update(json&);
+
+    void _clean_and_merge(json& defaults, const json& loaded);
 };
 
 } // namespace mod
