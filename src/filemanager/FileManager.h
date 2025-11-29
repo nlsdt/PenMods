@@ -127,6 +127,9 @@ private:
 
     enum class UserRoles { FileName = Qt::UserRole + 1, IsDirectory, SizeString, ExtensionName, ExtensionIcon, IsExecutable };
 
+    // Natural language comparison function for semantic sorting
+    static bool naturalCompare(const QString &a, const QString &b);
+
     std::string mClassName{"fm"};
     json        mCfg;
 

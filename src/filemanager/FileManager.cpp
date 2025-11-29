@@ -15,6 +15,7 @@
 
 #include "tweaker/ColumnDBLimiter.h"
 
+#include <QDateTime>
 #include <QFile>
 #include <QHash>
 #include <QQmlContext>
@@ -27,6 +28,9 @@ namespace mod::filemanager {
 
 static const char* HIDDEN_FLAG = ".HIDDEN_DIR";
 static size_t      MAX_FILES   = 65535;
+
+// Natural language sort flag (using a value that doesn't conflict with QDir constants)
+static const int NATURAL_SORT = 0x10000; // 65536 - using a value far outside standard QDir sort flags range
 
 FileManager::FileManager() : QAbstractListModel(), Logger("FileManager") {
 
@@ -148,12 +152,12 @@ QVariant FileManager::data(const QModelIndex& index, int role) const {
 
 QHash<int, QByteArray> FileManager::roleNames() const {
     return QHash<int, QByteArray>{
-        {(int)UserRoles::FileName,      "fileName"},
-        {(int)UserRoles::IsDirectory,   "isDir"   },
-        {(int)UserRoles::SizeString,    "sizeStr" },
-        {(int)UserRoles::ExtensionName, "extName" },
-        {(int)UserRoles::ExtensionIcon, "extIcon" },
-        {(int)UserRoles::IsExecutable, "isExecutable"}
+        {(int)UserRoles::FileName,      "fileName"    },
+        {(int)UserRoles::IsDirectory,   "isDir"       },
+        {(int)UserRoles::SizeString,    "sizeStr"     },
+        {(int)UserRoles::ExtensionName, "extName"     },
+        {(int)UserRoles::ExtensionIcon, "extIcon"     },
+        {(int)UserRoles::IsExecutable,  "isExecutable"}
     };
 };
 
@@ -349,54 +353,131 @@ void FileManager::_initCurrentDir() {
     }
 
     auto order = getOrder();
-    if (getOrderReversed()) {
-        order |= QDir::Reversed;
-    }
-    order     = order | QDir::DirsFirst | QDir::IgnoreCase;
     auto flags = QDir::Dirs | QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot;
     if (getShowHiddenFiles()) {
         flags |= QDir::Hidden;
     }
-    auto list = mCurrentPath.entryInfoList(
-        flags,
-        static_cast<QDir::SortFlags>(order)
-    );
 
-    if (list.empty()) {
-        emit error("空文件夹");
-        reset();
-        return;
-    }
+    // Check if we need to use natural language sorting
+    bool useNaturalSort = (order & NATURAL_SORT) != 0;
 
-    // To prevent memory overuse.
-    if ((size_t)list.size() > MAX_FILES) {
-        emit error("该目录下文件太多");
-        reset();
-        return;
-    }
+    // If natural sort is not selected, use Qt's built-in sorting
+    if (!useNaturalSort) {
+        if (getOrderReversed()) {
+            order |= QDir::Reversed;
+        }
+        order = order | QDir::DirsFirst | QDir::IgnoreCase;
 
-    // For paired lyrics auto-hidden.
-    std::vector<QString> pairedLyrics;
-    if (getHidePairedLyrics()) {
-        for (auto& i : list) {
-            auto path = i.absoluteFilePath();
-            if (path.endsWith(".mp3", Qt::CaseInsensitive)) { // Current only support mp3 format.
-                auto lrcPath = path.mid(0, path.length() - 4) + ".lrc";
-                if (QFile(lrcPath).exists()) {
-                    pairedLyrics.emplace_back(lrcPath);
+        auto list = mCurrentPath.entryInfoList(flags, static_cast<QDir::SortFlags>(order));
+
+        if (list.empty()) {
+            emit error("空文件夹");
+            reset();
+            return;
+        }
+
+        // To prevent memory overuse.
+        if ((size_t)list.size() > MAX_FILES) {
+            emit error("该目录下文件太多");
+            reset();
+            return;
+        }
+
+        // For paired lyrics auto-hidden.
+        std::vector<QString> pairedLyrics;
+        if (getHidePairedLyrics()) {
+            for (auto& i : list) {
+                auto path = i.absoluteFilePath();
+                if (path.endsWith(".mp3", Qt::CaseInsensitive)) { // Current only support mp3 format.
+                    auto lrcPath = path.mid(0, path.length() - 4) + ".lrc";
+                    if (QFile(lrcPath).exists()) {
+                        pairedLyrics.emplace_back(lrcPath);
+                    }
                 }
             }
         }
-    }
 
-    for (auto& i : list) {
-        if (std::find(pairedLyrics.begin(), pairedLyrics.end(), i.absoluteFilePath()) != pairedLyrics.end()) {
-            continue;
+        for (auto& i : list) {
+            if (std::find(pairedLyrics.begin(), pairedLyrics.end(), i.absoluteFilePath()) != pairedLyrics.end()) {
+                continue;
+            }
+            if (!getShowHiddenFiles() && i.fileName().startsWith('.')) {
+                continue;
+            }
+            mEntities.emplace_back(std::make_shared<QFileInfo>(i));
         }
-        if (!getShowHiddenFiles() && i.fileName().startsWith('.')) {
-            continue;
+    } else {
+        // For natural language sorting, get unsorted list and then sort manually
+        auto list = mCurrentPath.entryInfoList(flags, QDir::NoSort);
+
+        if (list.empty()) {
+            emit error("空文件夹");
+            reset();
+            return;
         }
-        mEntities.emplace_back(std::make_shared<QFileInfo>(i));
+
+        // To prevent memory overuse.
+        if ((size_t)list.size() > MAX_FILES) {
+            emit error("该目录下文件太多");
+            reset();
+            return;
+        }
+
+        // Sort using natural comparison
+        std::sort(list.begin(), list.end(), [order](const QFileInfo& a, const QFileInfo& b) {
+            // Handle directories first if needed
+            if ((order & QDir::DirsFirst) && a.isDir() != b.isDir()) {
+                return a.isDir(); // Directories come first
+            }
+
+            // Use natural language comparison for file/directory names
+            QString nameA = a.fileName();
+            QString nameB = b.fileName();
+
+            bool result;
+            if ((order & QDir::Reversed)) {
+                result = !FileManager::naturalCompare(nameA, nameB);
+            } else {
+                result = FileManager::naturalCompare(nameA, nameB);
+            }
+
+            // If names are equal, sort by other attributes to maintain consistent ordering
+            if (nameA == nameB) {
+                if ((order & QDir::Time)) {
+                    return a.lastModified() < b.lastModified(); // Earlier modified first
+                } else if ((order & QDir::Size)) {
+                    return a.size() < b.size(); // Smaller first
+                } else {
+                    return a.absoluteFilePath() < b.absoluteFilePath(); // Fallback to path
+                }
+            }
+
+            return result;
+        });
+
+        // For paired lyrics auto-hidden.
+        std::vector<QString> pairedLyrics;
+        if (getHidePairedLyrics()) {
+            for (auto& i : list) {
+                auto path = i.absoluteFilePath();
+                if (path.endsWith(".mp3", Qt::CaseInsensitive)) { // Current only support mp3 format.
+                    auto lrcPath = path.mid(0, path.length() - 4) + ".lrc";
+                    if (QFile(lrcPath).exists()) {
+                        pairedLyrics.emplace_back(lrcPath);
+                    }
+                }
+            }
+        }
+
+        for (auto& i : list) {
+            if (std::find(pairedLyrics.begin(), pairedLyrics.end(), i.absoluteFilePath()) != pairedLyrics.end()) {
+                continue;
+            }
+            if (!getShowHiddenFiles() && i.fileName().startsWith('.')) {
+                continue;
+            }
+            mEntities.emplace_back(std::make_shared<QFileInfo>(i));
+        }
     }
 }
 
@@ -473,6 +554,67 @@ void FileManager::executeFile(const QString& fileName) {
         delete process;
         return;
     }
+}
+
+bool FileManager::naturalCompare(const QString& a, const QString& b) {
+    // This implementation handles natural language sorting (alphanumeric sorting)
+    // It treats numeric portions as numbers instead of strings
+
+    int ia = 0, ib = 0;
+    while (ia < a.length() && ib < b.length()) {
+        // If both characters are digits, extract the full number sequence
+        if (a[ia].isDigit() && b[ib].isDigit()) {
+            // Find the end of the number in string a
+            int startA = ia;
+            while (ia < a.length() && a[ia].isDigit()) {
+                ia++;
+            }
+
+            // Find the end of the number in string b
+            int startB = ib;
+            while (ib < b.length() && b[ib].isDigit()) {
+                ib++;
+            }
+
+            // Extract the numeric parts
+            QString numStrA = a.mid(startA, ia - startA);
+            QString numStrB = b.mid(startB, ib - startB);
+
+            // Compare as numbers first (leading zeros should be handled appropriately)
+            bool   okA, okB;
+            qint64 numA = numStrA.toLongLong(&okA);
+            qint64 numB = numStrB.toLongLong(&okB);
+
+            if (okA && okB) {
+                if (numA != numB) {
+                    return numA < numB;
+                }
+            } else {
+                // Fallback to string comparison if conversion fails
+                int cmp = numStrA.compare(numStrB, Qt::CaseSensitive);
+                if (cmp != 0) {
+                    return cmp < 0;
+                }
+            }
+        } else {
+            // Compare as regular characters
+            QChar ca = a[ia];
+            QChar cb = b[ib];
+
+            // Convert to the same case for case-insensitive comparison
+            ca = ca.toLower();
+            cb = cb.toLower();
+
+            if (ca != cb) {
+                return ca < cb;
+            }
+            ia++;
+            ib++;
+        }
+    }
+
+    // If we've reached the end of one string, the shorter one should come first
+    return a.length() < b.length();
 }
 } // namespace mod::filemanager
 
