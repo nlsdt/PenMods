@@ -169,6 +169,7 @@ void ChatBot::sendMessage(const QString& message) {
     if (m_conversationHistory.size() > MAX_HISTORY_SIZE) {
         m_conversationHistory.dequeue();
     }
+    emit messagesChanged();
 
     makeApiRequest(messages);
 }
@@ -319,6 +320,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 if (m_conversationHistory.size() > MAX_HISTORY_SIZE) {
                     m_conversationHistory.dequeue();
                 }
+                emit messagesChanged();
             } else {
                 debug("流传输结束，但没有内容");
             }
@@ -345,6 +347,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                                 if (m_conversationHistory.size() > MAX_HISTORY_SIZE) {
                                     m_conversationHistory.dequeue();
                                 }
+                                emit messagesChanged();
                             }
                         }
                     }
@@ -374,6 +377,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
 void ChatBot::clearHistory() {
     debug("清除聊天历史记录");
     m_conversationHistory.clear();
+    emit messagesChanged();
 }
 
 // 保存聊天记录
@@ -538,6 +542,18 @@ void ChatBot::setDefaultPrompt(const QString& prompt) {
 
 // 流式传输相关的 getter 和 setter
 bool ChatBot::getIsStreaming() const { return m_isStreaming; }
+
+// 获取消息列表
+QVariantList ChatBot::getMessages() const {
+    QVariantList messageList;
+    for (const auto& pair : m_conversationHistory) {
+        QVariantMap message;
+        message["role"]    = pair.first;
+        message["content"] = pair.second;
+        messageList.append(message);
+    }
+    return messageList;
+}
 
 void ChatBot::setIsStreaming(bool streaming) {
     if (m_isStreaming != streaming) {

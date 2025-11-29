@@ -31,6 +31,7 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(QString defaultPrompt READ getDefaultPrompt WRITE setDefaultPrompt NOTIFY defaultPromptChanged)
     Q_PROPERTY(bool isStreaming READ getIsStreaming WRITE setIsStreaming NOTIFY isStreamingChanged)
     Q_PROPERTY(bool isAvailable READ isAvailable CONSTANT)
+    Q_PROPERTY(QVariantList messages READ getMessages NOTIFY messagesChanged)
 
 public:
     // 可供 QML 调用的方法
@@ -48,6 +49,7 @@ public:
     qreal   getTemperature() const;
     QString getDefaultPrompt() const;
     bool    getIsStreaming() const;
+    QVariantList getMessages() const;
 
     // 设置器（带信号）
     void setApiKey(const QString& key);
@@ -70,6 +72,7 @@ signals:
     void temperatureChanged();
     void defaultPromptChanged();
     void isStreamingChanged();
+    void messagesChanged();
 
 private:
     friend Singleton<ChatBot>;
