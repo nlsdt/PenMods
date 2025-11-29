@@ -40,7 +40,7 @@ QString ChatBot::markdownToHtml(const QString& markdown) {
     // 设置默认字体以匹配 UI
     QFont defaultFont;
     defaultFont.setPixelSize(12);
-    defaultFont.setFamily("Microsoft YaHei, SimSun, Arial");
+    defaultFont.setFamily("OPPOSans, OPPOSans M, Microsoft YaHei, SimSun, Arial");
     doc.setDefaultFont(defaultFont);
 
     // 设置默认样式表以调整行高
