@@ -145,7 +145,7 @@ void ChatBot::sendMessage(const QString& message) {
     // 添加系统消息
     QJsonObject systemMsg;
     systemMsg["role"]    = "system";
-    systemMsg["content"] = "你是一个有用的助手，使用中文回复用户的问题。";
+    systemMsg["content"] = m_defaultPrompt; // 使用用户设置的系统提示词
     messages.append(systemMsg);
 
     // 添加历史消息
