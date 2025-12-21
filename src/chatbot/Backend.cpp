@@ -210,6 +210,9 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     // 发送请求
     QNetworkReply* reply = m_networkManager->post(request, requestData);
 
+    // 将请求添加到活动列表中
+    m_activeReplies.append(reply);
+
     // 如果是流式传输，发出开始信号
     if (m_isStreaming) {
         m_currentStreamBuffer.clear();
@@ -226,6 +229,10 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
         if (reply->error() != QNetworkReply::NoError) {
             debug("网络错误: {}", reply->errorString().toStdString());
         }
+
+        // 从活动列表中移除已完成的请求
+        m_activeReplies.removeAll(reply);
+
         handleNetworkReply(reply, m_isStreaming);
     });
 
@@ -370,12 +377,26 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
         emit errorOccurred("API 请求失败: " + errorString);
     }
 
+    // 从活动列表中移除已完成的请求
+    m_activeReplies.removeAll(reply);
+
     reply->deleteLater();
 }
 
 // 清除历史记录
 void ChatBot::clearHistory() {
     debug("清除聊天历史记录");
+
+    // 终止所有活动的网络请求
+    for (QNetworkReply* reply : m_activeReplies) {
+        if (reply && !reply->isFinished()) {
+            debug("终止活动请求");
+            reply->abort(); // 中止请求
+        }
+    }
+    m_activeReplies.clear(); // 清空活动请求列表
+
+    // 清除历史记录
     m_conversationHistory.clear();
     emit messagesChanged();
 }

@@ -80,6 +80,7 @@ private:
 
     // 网络基础设施
     QNetworkAccessManager* m_networkManager;
+    QList<QNetworkReply*> m_activeReplies;  // 跟踪活动的网络请求
 
     // 配置
     QString m_apiKey;
