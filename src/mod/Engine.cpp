@@ -4,12 +4,16 @@
  * This file is part of the PenMods open source project.
  */
 
+#include "spdlog/spdlog.h"
 #if PL_BUILD_YDP02X
 #include "../resource/models/YDP02X/qrc_qml.h"
 #endif
 
 #include <QQmlContext>
 #include <QQuickView>
+
+#include <QFile>
+#include <dlfcn.h>
 
 #include "base/YPointer.h"
 
@@ -24,14 +28,51 @@ PEN_HOOK(void, _ZN22YGuiApplicationPrivate6initUiEv, QWindow** self) {
 
     emit mod::Event::getInstance().beforeUiInitialization(view, context);
 
+    bool                 using_external_resources = false;
+    const char*          ResourceLibPath          = "/userdata/PenMods/libPenModsResources.so";
+    const unsigned char* new_qt_resource_struct;
+    const unsigned char* new_qt_resource_data;
+    const unsigned char* new_qt_resource_name;
+    if (QFile::exists(ResourceLibPath)) {
+        void* lib = dlopen(ResourceLibPath, RTLD_NOW);
+        if (!lib) {
+            spdlog::error("Can't dlopen libPenModsResources.so");
+        } else {
+            using get_res_t = const unsigned char* (*)();
+
+            auto get_struct = (get_res_t)dlsym(lib, "get_qt_resource_struct");
+            auto get_data   = (get_res_t)dlsym(lib, "get_qt_resource_data");
+            auto get_name   = (get_res_t)dlsym(lib, "get_qt_resource_name");
+
+            Q_ASSERT(get_struct && get_data && get_name);
+
+            new_qt_resource_struct = get_struct();
+            new_qt_resource_data   = get_data();
+            new_qt_resource_name   = get_name();
+
+            spdlog::info("Using external Qt res.");
+            using_external_resources = true;
+        }
+    }
+
     // Replace QResources
     PEN_CALL(void*, "_Z21qCleanupResources_qmlv")();
-    auto res = PEN_CALL(bool, "_Z21qRegisterResourceDataiPKhS0_S0_", int, const uchar*, const uchar*, const uchar*)(
-        0x3,
-        qt_resource_struct,
-        qt_resource_name,
-        qt_resource_data
-    );
+    bool res;
+    if (using_external_resources) {
+        res = PEN_CALL(bool, "_Z21qRegisterResourceDataiPKhS0_S0_", int, const uchar*, const uchar*, const uchar*)(
+            0x3,
+            new_qt_resource_struct,
+            new_qt_resource_name,
+            new_qt_resource_data
+        );
+    } else {
+        res = PEN_CALL(bool, "_Z21qRegisterResourceDataiPKhS0_S0_", int, const uchar*, const uchar*, const uchar*)(
+            0x3,
+            qt_resource_struct,
+            qt_resource_name,
+            qt_resource_data
+        );
+    }
     if (res) {
         spdlog::info("Resource files have been replaced!");
     } else {

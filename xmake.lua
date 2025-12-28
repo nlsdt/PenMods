@@ -112,7 +112,13 @@ target('PenMods')
             get_config('build-platform'))
         )
     end)
-    
+
+-- Externalized resource library target
+target('PenModsResources')
+    set_kind('shared')
+    add_files('resource/externalize/**.cpp')
+    add_includedirs('resource/models/YDP02X')
+
 target('QrcExporter')
     add_rules('qt.shared')
     add_files('resource/exporter/**.cpp')
