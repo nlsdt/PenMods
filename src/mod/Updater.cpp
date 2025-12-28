@@ -21,7 +21,7 @@
 #define UH_TEMP_DIRNAME "modupdate"
 
 #if PL_BUILD_YDP02X
-#define UH_MAIN_URL "https://dictpen-backend.0xffffffffffffffff.xyz/"
+#define UH_MAIN_URL "https://cdn.jsdelivr.net/gh/lyrecoul/penmods-ota@main/updates.json"
 #endif
 
 namespace mod {
