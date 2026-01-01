@@ -63,7 +63,7 @@ ChatBot::ChatBot()
   m_isStreaming(true),
   m_currentStreamBuffer(""),
   m_responseBuffer("") {
-    debug("ChatBot 初始化完成");
+    info("ChatBot 初始化完成");
 
     // 从配置加载设置
     auto& config = mod::Config::getInstance();
@@ -87,7 +87,7 @@ ChatBot::ChatBot()
 
 // 重载配置
 void ChatBot::reloadConfig() {
-    debug("重载配置");
+    // debug("重载配置");
 
     auto& config = mod::Config::getInstance();
     json  aiCfg  = config.read("ai");
@@ -131,13 +131,13 @@ void ChatBot::reloadConfig() {
 // 检查功能是否可用：API 密钥已设置
 bool ChatBot::isAvailable() {
     bool available = !m_apiKey.isEmpty();
-    debug("ChatBot 可用性: {}", available ? "是" : "否");
+    // debug("ChatBot 可用性: {}", available ? "是" : "否");
     return available;
 }
 
 // 发送消息（使用内部历史记录）
 void ChatBot::sendMessage(const QString& message) {
-    debug("发送消息: {}", message.toStdString());
+    // debug("发送消息: {}", message.toStdString());
 
     // 构建消息数组，首先添加系统消息
     QJsonArray messages;
@@ -162,7 +162,7 @@ void ChatBot::sendMessage(const QString& message) {
     currentUserMsg["content"] = message;
     messages.append(currentUserMsg);
 
-    debug("消息总数: {}", messages.size());
+    // debug("消息总数: {}", messages.size());
 
     // 添加用户消息到历史
     m_conversationHistory.enqueue(qMakePair(QString("user"), message));
@@ -177,14 +177,14 @@ void ChatBot::sendMessage(const QString& message) {
 // 执行 API 请求
 void ChatBot::makeApiRequest(const QJsonArray& messages) {
     if (m_apiKey.isEmpty()) {
-        debug("API 密钥未设置");
+        // debug("API 密钥未设置");
         emit errorOccurred("API 密钥未设置");
         return;
     }
 
-    debug("开始发送 API 请求到: {}", m_apiEndpoint.toStdString());
-    debug("使用模型: {}", m_model.toStdString());
-    debug("流式传输: {}", m_isStreaming ? "是" : "否");
+    // debug("开始发送 API 请求到: {}", m_apiEndpoint.toStdString());
+    // debug("使用模型: {}", m_model.toStdString());
+    // debug("流式传输: {}", m_isStreaming ? "是" : "否");
 
     // 构建请求体
     QJsonObject requestBody;
@@ -251,14 +251,14 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                 for (const QString& line : lines) {
                     QString trimmedLine = line.trimmed();
 
-                    debug("处理行: {}", trimmedLine.toStdString());
+                    // debug("处理行: {}", trimmedLine.toStdString());
 
                     if (trimmedLine.startsWith("data: ")) {
                         QString jsonData = trimmedLine.mid(6); // 移除 "data: " 前缀
 
                         // 检查是否是结束标记
                         if (jsonData.trimmed() == "[DONE]") {
-                            debug("收到流结束标记");
+                            // debug("收到流结束标记");
                             emit streamEnd();
                             continue;
                         }
@@ -266,7 +266,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                         // 解析 JSON 数据
                         QJsonDocument doc = QJsonDocument::fromJson(jsonData.toUtf8());
                         if (doc.isObject()) {
-                            debug("解析 JSON 数据成功");
+                            // debug("解析 JSON 数据成功");
                             QJsonObject obj = doc.object();
                             if (obj.contains("choices") && obj["choices"].isArray()) {
                                 QJsonArray choices = obj["choices"].toArray();
@@ -279,7 +279,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                                             if (!content.isEmpty()) {
                                                 emit streamChunk(content);
                                                 m_currentStreamBuffer += content;
-                                                debug("接收到流片段: {}", content.toStdString());
+                                                // debug("接收到流片段: {}", content.toStdString());
                                             }
                                         }
                                     }
@@ -315,26 +315,23 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
 // 处理网络响应
 void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
     if (reply->error() == QNetworkReply::NoError) {
-        debug("网络请求成功完成");
+        // debug("网络请求成功完成");
         if (isStream) {
             // 流式传输：在 readyRead 中处理，这里只需要处理可能的结束逻辑
             if (!m_currentStreamBuffer.isEmpty()) {
-                debug("流式传输完成，将最终消息存入历史: {}", m_currentStreamBuffer.toStdString());
-                // 对于流式传输，UI 已通过 streamChunk 更新。
-                // 我们不再发射 messageReceived 信号。
-                // 我们只将最终的 AI 回复添加到后端的内部历史记录中。
+                // debug("流式传输完成，将最终消息存入历史: {}", m_currentStreamBuffer.toStdString());
                 m_conversationHistory.enqueue(qMakePair(QString("assistant"), m_currentStreamBuffer));
                 if (m_conversationHistory.size() > MAX_HISTORY_SIZE) {
                     m_conversationHistory.dequeue();
                 }
                 emit messagesChanged();
             } else {
-                debug("流传输结束，但没有内容");
+                // debug("流传输结束，但没有内容");
             }
         } else {
             // 完整响应处理
             QByteArray response = reply->readAll();
-            debug("完整响应数据: {}", QString(response).toStdString());
+            // debug("完整响应数据: {}", QString(response).toStdString());
             QJsonDocument doc = QJsonDocument::fromJson(response);
             if (doc.isObject()) {
                 QJsonObject obj = doc.object();
@@ -346,7 +343,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                             QJsonObject message = choice["message"].toObject();
                             if (message.contains("content") && message["content"].isString()) {
                                 QString content = message["content"].toString();
-                                debug("解析到完整响应内容: {}", content.toStdString());
+                                // debug("解析到完整响应内容: {}", content.toStdString());
                                 emit messageReceived(content, true);
 
                                 // 添加 AI 回复到历史
@@ -359,7 +356,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                         }
                     }
                 } else {
-                    debug("响应中没有找到 choices 字段");
+                    // debug("响应中没有找到 choices 字段");
                 }
             } else {
                 debug("响应 JSON 解析失败");
@@ -385,12 +382,12 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
 
 // 清除历史记录
 void ChatBot::clearHistory() {
-    debug("清除聊天历史记录");
+    // debug("清除聊天历史记录");
 
     // 终止所有活动的网络请求
     for (QNetworkReply* reply : m_activeReplies) {
         if (reply && !reply->isFinished()) {
-            debug("终止活动请求");
+            // debug("终止活动请求");
             reply->abort(); // 中止请求
         }
     }
@@ -414,7 +411,7 @@ void ChatBot::saveMessages() {
     QString fileName = "chat_" + QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss") + ".md";
     QString savePath = saveDir + "/" + fileName;
 
-    debug("保存聊天记录到: {}", savePath.toStdString());
+    // debug("保存聊天记录到: {}", savePath.toStdString());
 
     QFile file(savePath);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
@@ -443,7 +440,7 @@ void ChatBot::saveMessages() {
 
     showToast("保存成功");
 
-    info("聊天记录已成功保存到: {}", savePath.toStdString());
+    // info("聊天记录已成功保存到: {}", savePath.toStdString());
 }
 
 // API 密钥相关的 getter 和 setter
@@ -474,7 +471,7 @@ QString ChatBot::getApiEndpoint() const { return m_apiEndpoint; }
 
 void ChatBot::setApiEndpoint(const QString& endpoint) {
     if (m_apiEndpoint != endpoint) {
-        debug("设置 API 端点: {}", endpoint.toStdString());
+        // debug("设置 API 端点: {}", endpoint.toStdString());
         m_apiEndpoint = endpoint;
 
         // 保存到配置
@@ -497,7 +494,7 @@ QString ChatBot::getModel() const { return m_model; }
 
 void ChatBot::setModel(const QString& model) {
     if (m_model != model) {
-        debug("设置模型: {}", model.toStdString());
+        // debug("设置模型: {}", model.toStdString());
         m_model = model;
 
         // 保存到配置
@@ -520,7 +517,7 @@ qreal ChatBot::getTemperature() const { return m_temperature; }
 
 void ChatBot::setTemperature(qreal temp) {
     if (m_temperature != temp) {
-        debug("设置温度: {}", temp);
+        // debug("设置温度: {}", temp);
         m_temperature = temp;
 
         // 保存到配置
@@ -543,7 +540,7 @@ QString ChatBot::getDefaultPrompt() const { return m_defaultPrompt; }
 
 void ChatBot::setDefaultPrompt(const QString& prompt) {
     if (m_defaultPrompt != prompt) {
-        debug("设置默认提示词: {}", prompt.toStdString());
+        // debug("设置默认提示词: {}", prompt.toStdString());
         m_defaultPrompt = prompt;
 
         // 保存到配置
@@ -578,7 +575,7 @@ QVariantList ChatBot::getMessages() const {
 
 void ChatBot::setIsStreaming(bool streaming) {
     if (m_isStreaming != streaming) {
-        debug("设置流式传输: {}", streaming ? "是" : "否");
+        // debug("设置流式传输: {}", streaming ? "是" : "否");
         m_isStreaming = streaming;
 
         // 保存到配置
