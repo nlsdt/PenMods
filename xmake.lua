@@ -13,6 +13,7 @@ add_requires('libxcrypt     4.4.38', {
     configs = {shared = true}
 })
 add_requires("libwebp       1.3.0")
+add_requires('librime       1.15.0')
 
 --- options
 
@@ -91,7 +92,8 @@ target('PenMods')
         'lame',
         -- crypt, src/helper/ServiceManager.cpp
         'libxcrypt',
-        'libwebp')
+        'libwebp',
+        'librime')
     set_pcxxheader('src/base/Base.h')
     add_includedirs(
         'src',

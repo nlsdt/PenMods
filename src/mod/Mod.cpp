@@ -166,6 +166,8 @@ PEN_HOOK(bool, license_verify) { return true; }
 
 #include "chatbot/Backend.h"
 
+#include "rime/Backend.h"
+
 using namespace mod;
 
 __attribute__((constructor)) static void BeforeMain() {
@@ -239,6 +241,9 @@ __attribute__((constructor)) static void BeforeMain() {
 
     // chatbot
     INSTANCE(chatbot::ChatBot)
+
+    // rime
+    INSTANCE(rime::Backend)
 
 #undef INSTANCE
 }
