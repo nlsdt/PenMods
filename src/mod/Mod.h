@@ -18,18 +18,23 @@ class Mod : public QObject, public Singleton<Mod> {
     Q_OBJECT
 
     Q_PROPERTY(bool trustedDevice READ isTrustedDevice);
-    Q_PROPERTY(QString version READ getVersionStr);
-    Q_PROPERTY(uint32 cachedSymCount READ getCachedSymCount);
-    Q_PROPERTY(QString buildInfo READ getBuildInfoStr)
+    Q_PROPERTY(QString version READ getVersionStr NOTIFY versionChanged);
+    Q_PROPERTY(int cachedSymCount READ getCachedSymCount NOTIFY cachedSymCountChanged);
+    Q_PROPERTY(QString buildInfo READ getBuildInfoStr NOTIFY buildInfoChanged)
 
 public:
+    // 为属性变更添加信号
+    Q_SIGNAL void versionChanged();
+    Q_SIGNAL void cachedSymCountChanged();
+    Q_SIGNAL void buildInfoChanged();
+
     void onUiCompleted() const;
 
     [[nodiscard]] bool isTrustedDevice() const;
 
     [[nodiscard]] QString getVersionStr() const;
 
-    [[nodiscard]] size_t getCachedSymCount() const;
+    [[nodiscard]] int getCachedSymCount() const;
 
     [[nodiscard]] QString getBuildInfoStr() const;
 

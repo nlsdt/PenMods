@@ -35,6 +35,11 @@ Mod::Mod() {
             "PageIndex",
             "Not creatable as it is an enum type."
         );
+
+        // 发射属性变更信号，确保 QML 能正确获取初始值
+        emit versionChanged();
+        emit cachedSymCountChanged();
+        emit buildInfoChanged();
     });
 }
 
@@ -42,7 +47,7 @@ bool Mod::isTrustedDevice() const { return true; }
 
 QString Mod::getVersionStr() const { return VERSION_STRING; }
 
-size_t Mod::getCachedSymCount() const { return SymDB::getInstance().count(); }
+int Mod::getCachedSymCount() const { return static_cast<int>(SymDB::getInstance().count()); }
 
 QString Mod::getBuildInfoStr() const { return BUILD_INFO_STRING; }
 
