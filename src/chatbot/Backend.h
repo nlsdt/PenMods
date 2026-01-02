@@ -41,6 +41,8 @@ public:
     Q_INVOKABLE void clearHistory(); // 清除历史记录
     Q_INVOKABLE void saveMessages(); // 保存聊天记录
     Q_INVOKABLE QString markdownToHtml(const QString& markdown); // 将 Markdown 文本转换为 HTML
+    Q_INVOKABLE void truncateHistory(int index); // 截断历史记录到指定索引
+    Q_INVOKABLE void editMessage(int index, const QString& newContent); // 编辑指定索引的消息
 
     // 设置获取器
     QString getApiKey() const;

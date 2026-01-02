@@ -380,6 +380,40 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
     reply->deleteLater();
 }
 
+// 编辑指定索引的消息
+void ChatBot::editMessage(int index, const QString& newContent) {
+    if (index < 0 || index >= m_conversationHistory.size()) {
+        return; // 索引超出范围，直接返回
+    }
+
+    // 替换指定索引的消息内容
+    // 获取当前角色（user 或 assistant）
+    QString currentRole = m_conversationHistory[index].first;
+    // 替换为新的内容
+    m_conversationHistory[index] = qMakePair(currentRole, newContent);
+
+    // 然后截断该索引之后的所有消息
+    while (m_conversationHistory.size() > index + 1) {
+        m_conversationHistory.removeLast();
+    }
+
+    emit messagesChanged();
+}
+
+// 截断历史记录到指定索引
+void ChatBot::truncateHistory(int index) {
+    if (index < 0 || index >= m_conversationHistory.size()) {
+        return; // 索引超出范围，直接返回
+    }
+
+    // 保留从 0 到 index -1 的消息，移除从 index 开始的所有消息
+    while (m_conversationHistory.size() > index) {
+        m_conversationHistory.removeLast();
+    }
+
+    emit messagesChanged();
+}
+
 // 清除历史记录
 void ChatBot::clearHistory() {
     // debug("清除聊天历史记录");
