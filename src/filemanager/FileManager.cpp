@@ -18,11 +18,11 @@
 #include <QDateTime>
 #include <QFile>
 #include <QHash>
+#include <QProcess>
 #include <QQmlContext>
+#include <QSet>
 #include <QTimer>
 #include <QUrl>
-
-#include <QProcess>
 
 namespace mod::filemanager {
 
@@ -345,139 +345,140 @@ bool FileManager::isHasMore() const {
 }
 
 void FileManager::_initCurrentDir() {
-
+    // 1. 安全检查与重置
     if (Mod::getInstance().isTrustedDevice() && shouldHiddenAll()) {
         emit error("空文件夹");
         reset();
         return;
     }
 
+    // 确保清空旧数据，防止重复追加
+    mEntities.clear();
+
+    // 2. 准备标志位和排序参数
     auto order = getOrder();
     auto flags = QDir::Dirs | QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot;
     if (getShowHiddenFiles()) {
         flags |= QDir::Hidden;
     }
 
-    // Check if we need to use natural language sorting
     bool useNaturalSort = (order & NATURAL_SORT) != 0;
+    bool isReversed     = getOrderReversed() || (order & QDir::Reversed);
 
-    // If natural sort is not selected, use Qt's built-in sorting
+    // 如果不使用自然排序，直接让 QDir 处理排序，效率更高
+    QDir::SortFlags sortFlags = QDir::NoSort;
     if (!useNaturalSort) {
-        if (getOrderReversed()) {
-            order |= QDir::Reversed;
+        sortFlags = static_cast<QDir::SortFlags>(order | QDir::DirsFirst | QDir::IgnoreCase);
+        if (isReversed) {
+            sortFlags |= QDir::Reversed;
         }
-        order = order | QDir::DirsFirst | QDir::IgnoreCase;
+    }
 
-        auto list = mCurrentPath.entryInfoList(flags, static_cast<QDir::SortFlags>(order));
+    // 3. 获取文件列表
+    QFileInfoList list = mCurrentPath.entryInfoList(flags, sortFlags);
 
-        if (list.empty()) {
-            emit error("空文件夹");
-            reset();
-            return;
-        }
+    // 4. 基础校验
+    if (list.empty()) {
+        emit error("空文件夹");
+        reset();
+        return;
+    }
 
-        // To prevent memory overuse.
-        if ((size_t)list.size() > MAX_FILES) {
-            emit error("该目录下文件太多");
-            reset();
-            return;
-        }
+    // 防止内存滥用
+    if (static_cast<size_t>(list.size()) > MAX_FILES) {
+        emit error("该目录下文件太多");
+        reset();
+        return;
+    }
 
-        // For paired lyrics auto-hidden.
-        std::vector<QString> pairedLyrics;
-        if (getHidePairedLyrics()) {
-            for (auto& i : list) {
-                auto path = i.absoluteFilePath();
-                if (path.endsWith(".mp3", Qt::CaseInsensitive)) { // Current only support mp3 format.
-                    auto lrcPath = path.mid(0, path.length() - 4) + ".lrc";
-                    if (QFile(lrcPath).exists()) {
-                        pairedLyrics.emplace_back(lrcPath);
-                    }
+    // 5. 执行自然排序 (如果需要)
+    if (useNaturalSort) {
+        // 显式提取排序位
+        bool sortByTime = (order & QDir::Time);
+        bool sortBySize = (order & QDir::Size);
+
+        std::sort(
+            list.begin(),
+            list.end(),
+            [isReversed, sortByTime, sortBySize](const QFileInfo& a, const QFileInfo& b) {
+                // 始终将文件夹排在文件前面（不受反向排序影响）
+                // 如果 a 是文件夹而 b 不是，a 应该排在前面
+                if (a.isDir() && !b.isDir()) {
+                    return true;
                 }
-            }
-        }
+                // 如果 b 是文件夹而 a 不是，b 应该排在前面
+                if (!a.isDir() && b.isDir()) {
+                    return false;
+                }
 
-        for (auto& i : list) {
-            if (std::find(pairedLyrics.begin(), pairedLyrics.end(), i.absoluteFilePath()) != pairedLyrics.end()) {
-                continue;
-            }
-            if (!getShowHiddenFiles() && i.fileName().startsWith('.')) {
-                continue;
-            }
-            mEntities.emplace_back(std::make_shared<QFileInfo>(i));
-        }
-    } else {
-        // For natural language sorting, get unsorted list and then sort manually
-        auto list = mCurrentPath.entryInfoList(flags, QDir::NoSort);
+                // 如果两者都是文件夹或都是文件，继续下面的排序逻辑
+                // 内部比较 lambda
+                auto compareLogic = [&](const QFileInfo& fa, const QFileInfo& fb) -> bool {
+                    QString nameA = fa.fileName();
+                    QString nameB = fb.fileName();
 
-        if (list.empty()) {
-            emit error("空文件夹");
-            reset();
-            return;
-        }
+                    // 极速路径优化
+                    if (!nameA.isEmpty() && !nameB.isEmpty()) {
+                        QChar cA = nameA.front();
+                        QChar cB = nameB.front();
+                        if (!cA.isDigit() && !cB.isDigit() && cA.toLower() != cB.toLower()) {
+                            return cA.toLower() < cB.toLower();
+                        }
+                    }
 
-        // To prevent memory overuse.
-        if ((size_t)list.size() > MAX_FILES) {
-            emit error("该目录下文件太多");
-            reset();
-            return;
-        }
+                    if (nameA == nameB) {
+                        if (sortByTime) return fa.lastModified() < fb.lastModified();
+                        if (sortBySize) return fa.size() < fb.size();
+                        return fa.absoluteFilePath() < fb.absoluteFilePath();
+                    }
 
-        // Sort using natural comparison
-        std::sort(list.begin(), list.end(), [order](const QFileInfo& a, const QFileInfo& b) {
-            // Handle directories first if needed
-            if ((order & QDir::DirsFirst) && a.isDir() != b.isDir()) {
-                return a.isDir(); // Directories come first
-            }
+                    return FileManager::naturalCompare(nameA, nameB);
+                };
 
-            // Use natural language comparison for file/directory names
-            QString nameA = a.fileName();
-            QString nameB = b.fileName();
-
-            bool result;
-            if ((order & QDir::Reversed)) {
-                result = !FileManager::naturalCompare(nameA, nameB);
-            } else {
-                result = FileManager::naturalCompare(nameA, nameB);
-            }
-
-            // If names are equal, sort by other attributes to maintain consistent ordering
-            if (nameA == nameB) {
-                if ((order & QDir::Time)) {
-                    return a.lastModified() < b.lastModified(); // Earlier modified first
-                } else if ((order & QDir::Size)) {
-                    return a.size() < b.size(); // Smaller first
+                // 根据 isReversed 决定顺序
+                if (isReversed) {
+                    return compareLogic(b, a);
                 } else {
-                    return a.absoluteFilePath() < b.absoluteFilePath(); // Fallback to path
+                    return compareLogic(a, b);
                 }
             }
+        );
+    }
 
-            return result;
-        });
+    // 6. 处理同名歌词文件隐藏
+    QSet<QString> filesToHide;
+    if (getHidePairedLyrics()) {
+        QSet<QString> currentFileNames;
+        currentFileNames.reserve(list.size());
+        for (const auto& i : list) {
+            currentFileNames.insert(i.fileName());
+        }
 
-        // For paired lyrics auto-hidden.
-        std::vector<QString> pairedLyrics;
-        if (getHidePairedLyrics()) {
-            for (auto& i : list) {
-                auto path = i.absoluteFilePath();
-                if (path.endsWith(".mp3", Qt::CaseInsensitive)) { // Current only support mp3 format.
-                    auto lrcPath = path.mid(0, path.length() - 4) + ".lrc";
-                    if (QFile(lrcPath).exists()) {
-                        pairedLyrics.emplace_back(lrcPath);
+        for (const auto& i : list) {
+            if (i.fileName().endsWith(".mp3", Qt::CaseInsensitive)) {
+                QString lrcName = i.fileName();
+                // 简单的后缀替换，需确保长度足够
+                if (lrcName.length() > 4) {
+                    lrcName.replace(lrcName.length() - 4, 4, ".lrc");
+                    if (currentFileNames.contains(lrcName)) {
+                        filesToHide.insert(mCurrentPath.filePath(lrcName));
                     }
                 }
             }
         }
+    }
 
-        for (auto& i : list) {
-            if (std::find(pairedLyrics.begin(), pairedLyrics.end(), i.absoluteFilePath()) != pairedLyrics.end()) {
-                continue;
-            }
-            if (!getShowHiddenFiles() && i.fileName().startsWith('.')) {
-                continue;
-            }
-            mEntities.emplace_back(std::make_shared<QFileInfo>(i));
+    // 7. 填充 mEntities
+    mEntities.reserve(list.size());
+
+    for (const auto& i : list) {
+        if (!filesToHide.empty() && filesToHide.contains(i.absoluteFilePath())) {
+            continue;
         }
+        if (!getShowHiddenFiles() && i.fileName().startsWith('.')) {
+            continue;
+        }
+        mEntities.emplace_back(std::make_shared<QFileInfo>(i));
     }
 }
 
@@ -557,64 +558,72 @@ void FileManager::executeFile(const QString& fileName) {
 }
 
 bool FileManager::naturalCompare(const QString& a, const QString& b) {
-    // This implementation handles natural language sorting (alphanumeric sorting)
-    // It treats numeric portions as numbers instead of strings
+    const QChar* itA  = a.unicode();
+    const QChar* itB  = b.unicode();
+    const QChar* endA = itA + a.length();
+    const QChar* endB = itB + b.length();
 
-    int ia = 0, ib = 0;
-    while (ia < a.length() && ib < b.length()) {
-        // If both characters are digits, extract the full number sequence
-        if (a[ia].isDigit() && b[ib].isDigit()) {
-            // Find the end of the number in string a
-            int startA = ia;
-            while (ia < a.length() && a[ia].isDigit()) {
-                ia++;
+    while (itA != endA && itB != endB) {
+        // 检查当前字符是否都是数字
+        if (itA->isDigit() && itB->isDigit()) {
+            // 1. 跳过前导零
+            const QChar* startA = itA;
+            while (itA != endA && *itA == '0') ++itA;
+
+            const QChar* startB = itB;
+            while (itB != endB && *itB == '0') ++itB;
+
+            // 2. 计算有效数字部分的长度 (即去掉前导零后的长度)
+            const QChar* significantA = itA;
+            while (itA != endA && itA->isDigit()) ++itA;
+            qint64 lenA = itA - significantA;
+
+            const QChar* significantB = itB;
+            while (itB != endB && itB->isDigit()) ++itB;
+            qint64 lenB = itB - significantB;
+
+            // 3. 比较逻辑
+            // 规则 A: 有效数字越长，数值越大 (例如 100 > 50)
+            if (lenA != lenB) {
+                return lenA < lenB;
             }
 
-            // Find the end of the number in string b
-            int startB = ib;
-            while (ib < b.length() && b[ib].isDigit()) {
-                ib++;
-            }
-
-            // Extract the numeric parts
-            QString numStrA = a.mid(startA, ia - startA);
-            QString numStrB = b.mid(startB, ib - startB);
-
-            // Compare as numbers first (leading zeros should be handled appropriately)
-            bool   okA, okB;
-            qint64 numA = numStrA.toLongLong(&okA);
-            qint64 numB = numStrB.toLongLong(&okB);
-
-            if (okA && okB) {
-                if (numA != numB) {
-                    return numA < numB;
-                }
-            } else {
-                // Fallback to string comparison if conversion fails
-                int cmp = numStrA.compare(numStrB, Qt::CaseSensitive);
-                if (cmp != 0) {
-                    return cmp < 0;
+            // 规则 B: 长度相同，逐位比较 (例如 123 < 124)
+            // 此时不用担心溢出，因为只是字符比较
+            for (qint64 i = 0; i < lenA; ++i) {
+                if (significantA[i] != significantB[i]) {
+                    return significantA[i] < significantB[i];
                 }
             }
+
+            // 规则 C: 数值完全相等 (例如 "01" 和 "1")
+            // 此时通常比较前导零的个数，或者认为它们“相等”
+            // 为了排序稳定性，通常认为较长的原始字符串（即前导零多的）排在后面或前面
+            // 这里采用：原数字串较短的排在前面 (即 1 < 01)
+            qint64 originLenA = itA - startA; // 包含前导零的长度
+            qint64 originLenB = itB - startB;
+            if (originLenA != originLenB) {
+                return originLenA < originLenB;
+            }
+
+            // 如果连前导零都一样，继续循环比较后面的字符
         } else {
-            // Compare as regular characters
-            QChar ca = a[ia];
-            QChar cb = b[ib];
+            // 普通字符比较：忽略大小写
+            // QChar::toLower() 是内联的且很快
+            QChar cA = itA->toLower();
+            QChar cB = itB->toLower();
 
-            // Convert to the same case for case-insensitive comparison
-            ca = ca.toLower();
-            cb = cb.toLower();
-
-            if (ca != cb) {
-                return ca < cb;
+            if (cA != cB) {
+                return cA < cB;
             }
-            ia++;
-            ib++;
+
+            ++itA;
+            ++itB;
         }
     }
 
-    // If we've reached the end of one string, the shorter one should come first
-    return a.length() < b.length();
+    // 如果一个字符串结束了，较短的排在前面
+    return (itA == endA) && (itB != endB);
 }
 } // namespace mod::filemanager
 
