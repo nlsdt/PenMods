@@ -44,6 +44,8 @@ public:
 
     [[nodiscard]] QDir const& getCurrentPath() const;
 
+    Q_INVOKABLE QString getCurrentPathString() const;
+
     Q_INVOKABLE bool changeDir(const QString& dir);
 
     Q_INVOKABLE [[nodiscard]] bool canCdUp() const;

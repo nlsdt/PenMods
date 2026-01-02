@@ -176,6 +176,8 @@ void FileManager::onDirectoryChanged(const QString& path) {
 
 QDir const& FileManager::getCurrentPath() const { return mCurrentPath; }
 
+QString FileManager::getCurrentPathString() const { return mCurrentPath.path(); }
+
 bool FileManager::changeDir(const QString& dir) {
     if (dir.isEmpty()) {
         return changeDir(mRoot);
