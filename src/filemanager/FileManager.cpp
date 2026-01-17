@@ -23,6 +23,12 @@
 #include <QSet>
 #include <QTimer>
 #include <QUrl>
+#include <QThread>
+#include <QMutexLocker>
+
+#include <sys/inotify.h>
+#include <unistd.h>
+#include <errno.h>
 
 namespace mod::filemanager {
 
@@ -44,7 +50,7 @@ FileManager::FileManager() : QAbstractListModel(), Logger("FileManager") {
     // 初始化路径历史，设置初始路径为根目录
     mPathHistory.push_back(mRoot);
 
-    connect(&mFileSystemWatcher, &QFileSystemWatcher::directoryChanged, this, &FileManager::onDirectoryChanged);
+    setupInotify();
     connect(&Event::getInstance(), &Event::uiCompleted, [this]() {
         if (shouldHiddenAll()) {
             QTimer::singleShot(15000, this, [&]() { setMtpOnoff(false); });
@@ -206,7 +212,6 @@ bool FileManager::changeDir(const QString& dir) {
         }
     } else {
         debug("Move to dir -> {}", dir.toStdString());
-        mFileSystemWatcher.removePath(mCurrentPath.absolutePath());
 
         // 检查是否是软链接目录
         QString targetPath = mCurrentPath.absoluteFilePath(dir);
@@ -236,15 +241,14 @@ bool FileManager::changeDir(const QString& dir) {
         mPathHistory.push_back(nextPath);
     }
 
+    // 更新 inotify 监视
+    QMutexLocker locker(&mInotifyMutex);
+    addInotifyWatch(mCurrentPath.path());
+
     emit currentTitleChanged();
     reset();
     _initCurrentDir();
     loadMore();
-    if (!mFileSystemWatcher.addPath(mCurrentPath.absolutePath())) {
-        debug("failed to add path watcher");
-    } else {
-        debug("path watcher added");
-    }
     return true;
 }
 
@@ -592,9 +596,11 @@ void FileManager::setShowHiddenFiles(bool val) {
 void FileManager::playFromView(const QString& fileName) {
     if (mCurrentPlayingPath != mCurrentPath) {
         refreshPlayList();
-        mFileSystemWatcher.removePath(mCurrentPlayingPath.absolutePath());
         mCurrentPlayingPath = mCurrentPath;
-        mFileSystemWatcher.addPath(mCurrentPlayingPath.absolutePath());
+
+        // 更新 inotify 监视
+        QMutexLocker locker(&mInotifyMutex);
+        addInotifyWatch(mCurrentPlayingPath.path());
     }
     size_t idx   = 0;
     bool   valid = false;
@@ -711,6 +717,141 @@ bool FileManager::naturalCompare(const QString& a, const QString& b) {
 
     // 如果一个字符串结束了，较短的排在前面
     return (itA == endA) && (itB != endB);
+}
+
+void FileManager::setupInotify() {
+    mInotifyFd = inotify_init1(IN_NONBLOCK);
+    if (mInotifyFd < 0) {
+        error("Failed to initialize inotify: {}", strerror(errno));
+        return;
+    }
+
+    // 监听当前路径
+    if (!mCurrentPath.path().isEmpty()) {
+        addInotifyWatch(mCurrentPath.path());
+    }
+
+    // 同时监听播放路径
+    if (!mCurrentPlayingPath.path().isEmpty()) {
+        addInotifyWatch(mCurrentPlayingPath.path());
+    }
+
+    startInotifyThread();
+}
+
+void FileManager::addInotifyWatch(const QString& path) {
+    if (mInotifyFd >= 0) {
+        // 先移除旧的监视
+        if (mWatchFd >= 0) {
+            inotify_rm_watch(mInotifyFd, mWatchFd);
+        }
+
+        // 添加新的监视
+        mWatchFd = inotify_add_watch(mInotifyFd, path.toLocal8Bit().data(),
+                                   IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY);
+        if (mWatchFd < 0) {
+            error("Failed to add inotify watch for path {}: {}", path.toStdString(), strerror(errno));
+        } else {
+            debug("Added inotify watch for path: {}", path.toStdString());
+        }
+    }
+}
+
+void FileManager::cleanupInotify() {
+    stopInotifyThread();
+
+    if (mInotifyFd >= 0) {
+        if (mWatchFd >= 0) {
+            inotify_rm_watch(mInotifyFd, mWatchFd);
+            mWatchFd = -1;
+        }
+        close(mInotifyFd);
+        mInotifyFd = -1;
+    }
+}
+
+void FileManager::startInotifyThread() {
+    if (mInotifyThread == nullptr) {
+        mInotifyThread = new QThread(this);
+        // 创建一个辅助对象来运行 inotify 循环
+        QObject* worker = new QObject();
+        worker->moveToThread(mInotifyThread);
+
+        connect(mInotifyThread, &QThread::started, worker, [this, worker]() {
+            inotifyLoop();
+            worker->deleteLater(); // 确保 worker 对象被删除
+        });
+
+        connect(mInotifyThread, &QThread::finished, worker, []() {
+            // 线程结束时 worker 会被自动删除
+        });
+
+        mInotifyThread->start();
+    }
+}
+
+void FileManager::stopInotifyThread() {
+    if (mInotifyThread != nullptr) {
+        mInotifyThread->quit();
+        mInotifyThread->wait();
+        delete mInotifyThread;
+        mInotifyThread = nullptr;
+    }
+}
+
+void FileManager::inotifyLoop() {
+    char buffer[4096];
+    fd_set readfds;
+
+    while (true) {
+        FD_ZERO(&readfds);
+        FD_SET(mInotifyFd, &readfds);
+
+        // 使用 select 等待事件，超时时间为 1 秒，以便能够响应线程退出信号
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        int ret = select(mInotifyFd + 1, &readfds, nullptr, nullptr, &timeout);
+
+        if (ret < 0) {
+            if (errno != EINTR) {
+                error("Select error: {}", strerror(errno));
+            }
+            break;
+        } else if (ret > 0 && FD_ISSET(mInotifyFd, &readfds)) {
+            ssize_t len = read(mInotifyFd, buffer, sizeof(buffer));
+
+            if (len > 0) {
+                int i = 0;
+                while (i < len) {
+                    struct inotify_event* event = (struct inotify_event*)&buffer[i];
+
+                    if (event->mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY)) {
+                        // 发出目录更改信号
+                        QMetaObject::invokeMethod(this, [this]() {
+                            emit directoryChanged();
+
+                            // 如果当前播放路径发生变化，刷新播放列表
+                            if (mCurrentPath == mCurrentPlayingPath) {
+                                refreshPlayList();
+                            }
+                        }, Qt::QueuedConnection);
+                    }
+
+                    i += sizeof(struct inotify_event) + event->len;
+                }
+            } else if (len < 0 && errno != EAGAIN) {
+                error("Read error: {}", strerror(errno));
+                break;
+            }
+        }
+
+        // 检查线程是否被要求退出
+        if (QThread::currentThread()->isInterruptionRequested()) {
+            break;
+        }
+    }
 }
 } // namespace mod::filemanager
 

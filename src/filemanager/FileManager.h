@@ -13,7 +13,8 @@
 #include <QAbstractListModel>
 #include <QDir>
 #include <QFileInfo>
-#include <QFileSystemWatcher>
+#include <QThread>
+#include <QMutex>
 
 namespace mod::filemanager {
 
@@ -137,7 +138,11 @@ private:
 
     const QString mRoot{"/userdisk/Music"};
 
-    QFileSystemWatcher mFileSystemWatcher;
+    // Inotify variables
+    int mInotifyFd{-1};
+    int mWatchFd{-1};
+    QThread* mInotifyThread{nullptr};
+    mutable QMutex mInotifyMutex;
     std::atomic<bool>  mShouldNotifyDirChanged{true};
 
     int  mOrder;
@@ -151,6 +156,14 @@ private:
     std::vector<QString>                    mPathHistory;
 
     void _initCurrentDir();
+
+    // Inotify functions
+    void setupInotify();
+    void cleanupInotify();
+    void startInotifyThread();
+    void stopInotifyThread();
+    void inotifyLoop();
+    void addInotifyWatch(const QString& path);
 
     // MusicPlayer
 
