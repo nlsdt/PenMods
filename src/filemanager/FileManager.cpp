@@ -41,6 +41,9 @@ FileManager::FileManager() : QAbstractListModel(), Logger("FileManager") {
     mHidePairedLyrics = mCfg["hide_paired_lyrics"];
     mShowHiddenFiles  = mCfg["show_hidden_files"];
 
+    // 初始化路径历史，设置初始路径为根目录
+    mPathHistory.push_back(mRoot);
+
     connect(&mFileSystemWatcher, &QFileSystemWatcher::directoryChanged, this, &FileManager::onDirectoryChanged);
     connect(&Event::getInstance(), &Event::uiCompleted, [this]() {
         if (shouldHiddenAll()) {
@@ -83,6 +86,10 @@ QVariant FileManager::data(const QModelIndex& index, int role) const {
     };
 
     auto getExtIcon = [&]() -> QString {
+        if (entity->isSymLink()) {
+            return "qrc:/images/format/symlink.png";
+        }
+
         if (entity->isDir()) {
             return "qrc:/images/folder-empty.png";
         }
@@ -145,6 +152,8 @@ QVariant FileManager::data(const QModelIndex& index, int role) const {
         return getExtIcon();
     case UserRoles::IsExecutable:
         return entity->isExecutable();
+    case UserRoles::IsSymLink:
+        return entity->isSymLink();
     default:
         return {};
     }
@@ -157,7 +166,8 @@ QHash<int, QByteArray> FileManager::roleNames() const {
         {(int)UserRoles::SizeString,    "sizeStr"     },
         {(int)UserRoles::ExtensionName, "extName"     },
         {(int)UserRoles::ExtensionIcon, "extIcon"     },
-        {(int)UserRoles::IsExecutable,  "isExecutable"}
+        {(int)UserRoles::IsExecutable,  "isExecutable"},
+        {(int)UserRoles::IsSymLink,     "isSymLink"}
     };
 };
 
@@ -180,13 +190,52 @@ QString FileManager::getCurrentPathString() const { return mCurrentPath.path(); 
 
 bool FileManager::changeDir(const QString& dir) {
     if (dir.isEmpty()) {
-        return changeDir(mRoot);
+        // 返回根目录
+        mPathHistory.clear();
+        mPathHistory.push_back(mRoot);
+        mCurrentPath.setPath(mRoot);
+    } else if (dir == "..") {
+        // 返回上级目录
+        if (mPathHistory.size() > 1) {
+            mPathHistory.pop_back(); // 弹出当前路径
+            QString prevPath = mPathHistory.back(); // 获取上一级路径
+            mCurrentPath.setPath(prevPath);
+        } else {
+            // 如果已经是根目录或路径历史为空，不做任何操作
+            return false;
+        }
+    } else {
+        debug("Move to dir -> {}", dir.toStdString());
+        mFileSystemWatcher.removePath(mCurrentPath.absolutePath());
+
+        // 检查是否是软链接目录
+        QString targetPath = mCurrentPath.absoluteFilePath(dir);
+        QFileInfo fileInfo(targetPath);
+
+        QString nextPath;
+        if (fileInfo.isSymLink()) {
+            // 如果是软链接，获取其指向的实际路径
+            QString linkTarget = fileInfo.symLinkTarget();
+            if (!linkTarget.isEmpty() && QDir(linkTarget).exists()) {
+                nextPath = linkTarget;
+            } else {
+                // 如果软链接无效，尝试直接使用原路径
+                nextPath = mCurrentPath.absoluteFilePath(dir);
+            }
+        } else {
+            nextPath = mCurrentPath.absoluteFilePath(dir);
+        }
+
+        // 验证路径是否存在
+        if (!QDir(nextPath).exists()) {
+            return false;
+        }
+
+        // 更新路径历史
+        mCurrentPath.setPath(nextPath);
+        mPathHistory.push_back(nextPath);
     }
-    debug("Move to dir -> {}", dir.toStdString());
-    mFileSystemWatcher.removePath(mCurrentPath.absolutePath());
-    if (!mCurrentPath.cd(dir)) {
-        return false;
-    }
+
     emit currentTitleChanged();
     reset();
     _initCurrentDir();
@@ -200,9 +249,8 @@ bool FileManager::changeDir(const QString& dir) {
 }
 
 bool FileManager::canCdUp() const {
-    auto curLength  = mCurrentPath.path().length();
-    auto rootLength = mRoot.length();
-    return curLength != rootLength && curLength - 1 != rootLength;
+    // 检查路径历史栈，如果有多个路径则可以返回上级
+    return mPathHistory.size() > 1;
 }
 
 void FileManager::loadMore() { loadMore(1500); }
@@ -216,7 +264,12 @@ void FileManager::loadMore(int amount) {
     emit hasMoreChanged();
 }
 
-void FileManager::reload() { changeDir("."); }
+void FileManager::reload() {
+    // 重新加载当前目录，但不改变路径历史
+    reset();
+    _initCurrentDir();
+    loadMore();
+}
 
 void FileManager::reset() {
     beginResetModel();
@@ -236,8 +289,15 @@ void FileManager::remove(const QString& fileName) {
             idx++;
             continue;
         }
-        if (i->isDir()) {
-            exec(QString("rm -rf \"%1\"").arg(mCurrentPath.absoluteFilePath(fileName)));
+
+        QString filePath = mCurrentPath.absoluteFilePath(fileName);
+        QFileInfo fileInfo(filePath);
+
+        if (fileInfo.isSymLink()) {
+            // 如果是软链接，只需删除链接本身，而不删除目标
+            mCurrentPath.remove(fileName);
+        } else if (i->isDir()) {
+            exec(QString("rm -rf \"%1\"").arg(filePath));
         } else {
             mCurrentPath.remove(fileName);
         }
@@ -329,6 +389,12 @@ void FileManager::setOrderReversed(bool val) {
 }
 
 QString FileManager::getCurrentTitle() const {
+    // 使用路径历史来构建标题，这样可以正确反映用户导航路径
+    if (mPathHistory.empty()) {
+        return "(根目录)";
+    }
+
+    // 获取当前路径相对于根目录的部分
     auto    path = mCurrentPath.path().remove(0, mRoot.size());
     QString ret  = "(根目录)";
     auto    list = path.split("/", Qt::SkipEmptyParts);
@@ -359,7 +425,7 @@ void FileManager::_initCurrentDir() {
 
     // 2. 准备标志位和排序参数
     auto order = getOrder();
-    auto flags = QDir::Dirs | QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot;
+    auto flags = QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot;
     if (getShowHiddenFiles()) {
         flags |= QDir::Hidden;
     }
@@ -411,6 +477,15 @@ void FileManager::_initCurrentDir() {
                 // 如果 b 是文件夹而 a 不是，b 应该排在前面
                 if (!a.isDir() && b.isDir()) {
                     return false;
+                }
+
+                // 如果两者都是软链接或都不是软链接，继续下面的排序逻辑
+                // 如果其中一个为软链接，另一个不是，优先显示非软链接
+                if (a.isSymLink() && !b.isSymLink()) {
+                    return false; // 软链接排在后面
+                }
+                if (!a.isSymLink() && b.isSymLink()) {
+                    return true; // 非软链接排在前面
                 }
 
                 // 如果两者都是文件夹或都是文件，继续下面的排序逻辑
@@ -545,6 +620,16 @@ void FileManager::refreshPlayList() {
 
 void FileManager::executeFile(const QString& fileName) {
     QString filePath = mCurrentPath.absoluteFilePath(fileName);
+    QFileInfo fileInfo(filePath);
+
+    // 如果是软链接，获取目标文件路径
+    if (fileInfo.isSymLink()) {
+        QString targetPath = fileInfo.symLinkTarget();
+        if (!targetPath.isEmpty()) {
+            filePath = targetPath;
+        }
+    }
+
     if (!QFileInfo(filePath).isExecutable()) {
         emit exception("文件不可执行");
         return;

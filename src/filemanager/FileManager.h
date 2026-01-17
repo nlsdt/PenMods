@@ -127,7 +127,7 @@ private:
 
     // FileManager
 
-    enum class UserRoles { FileName = Qt::UserRole + 1, IsDirectory, SizeString, ExtensionName, ExtensionIcon, IsExecutable };
+    enum class UserRoles { FileName = Qt::UserRole + 1, IsDirectory, SizeString, ExtensionName, ExtensionIcon, IsExecutable, IsSymLink };
 
     // Natural language comparison function for semantic sorting
     static bool naturalCompare(const QString &a, const QString &b);
@@ -146,6 +146,9 @@ private:
     QDir                                    mCurrentPath;
     std::vector<std::shared_ptr<QFileInfo>> mEntities;
     int                                     mProxyCount{};
+
+    // 路径历史栈，用于跟踪包括软链接在内的路径变化
+    std::vector<QString>                    mPathHistory;
 
     void _initCurrentDir();
 
