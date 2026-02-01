@@ -398,6 +398,28 @@ void ChatBot::editMessage(int index, const QString& newContent) {
     }
 
     emit messagesChanged();
+
+    // 如果编辑的是用户消息，且它是当前最后一条消息，则自动重新发起AI请求
+    if (currentRole == "user" && index == m_conversationHistory.size() - 1) {
+        // 构建消息数组，首先添加系统消息
+        QJsonArray messages;
+
+        // 添加系统消息
+        QJsonObject systemMsg;
+        systemMsg["role"]    = "system";
+        systemMsg["content"] = m_defaultPrompt; // 使用用户设置的系统提示词
+        messages.append(systemMsg);
+
+        // 添加历史消息
+        for (const auto& pair : m_conversationHistory) {
+            QJsonObject msg;
+            msg["role"]    = pair.first; // "user" 或 "assistant"
+            msg["content"] = pair.second;
+            messages.append(msg);
+        }
+
+        makeApiRequest(messages);
+    }
 }
 
 // 截断历史记录到指定索引
@@ -412,6 +434,90 @@ void ChatBot::truncateHistory(int index) {
     }
 
     emit messagesChanged();
+}
+
+// 删除指定索引的单条消息
+void ChatBot::deleteMessage(int index) {
+    if (index < 0 || index >= m_conversationHistory.size()) {
+        return; // 索引超出范围，直接返回
+    }
+
+    // 由于 QQueue 没有 remove 方法，我们需要将其转换为可随机访问的容器
+    // 将队列内容复制到 QVector 中进行操作
+    QVector<QPair<QString, QString>> tempVector;
+    for (int i = 0; i < m_conversationHistory.size(); ++i) {
+        tempVector.append(m_conversationHistory[i]);
+    }
+
+    // 从 QVector 中删除指定索引
+    if (index >= 0 && index < tempVector.size()) {
+        tempVector.remove(index);
+    }
+
+    // 清空原队列并重新填充
+    m_conversationHistory.clear();
+    for (const auto& pair : tempVector) {
+        m_conversationHistory.enqueue(pair);
+    }
+
+    emit messagesChanged();
+}
+
+// 重新生成指定索引的 AI 消息
+void ChatBot::regenerateMessage(int index) {
+    if (index < 0 || index >= m_conversationHistory.size()) {
+        return; // 索引超出范围，直接返回
+    }
+
+    // 检查指定索引的消息是否为 AI 消息
+    if (m_conversationHistory[index].first != "assistant") {
+        error("只能重新生成 AI 消息，索引 {} 处的消息不是 AI 消息", index);
+        return;
+    }
+
+    // 获取 AI 消息对应之前的用户消息
+    int userMessageIndex = -1;
+    for (int i = index - 1; i >= 0; i--) {
+        if (m_conversationHistory[i].first == "user") {
+            userMessageIndex = i;
+            break;
+        }
+    }
+
+    if (userMessageIndex == -1) {
+        error("找不到对应于 AI 消息的用户消息，索引: {}", index);
+        return;
+    }
+
+    // 截断从用户消息开始之后的所有消息
+    while (m_conversationHistory.size() > userMessageIndex + 1) {
+        m_conversationHistory.removeLast();
+    }
+
+    // 通知 UI 更新消息列表
+    emit messagesChanged();
+
+    // 重新发送用户消息以获取新的 AI 回复
+    QString userMessage = m_conversationHistory[userMessageIndex].second;
+
+    // 构建消息数组，首先添加系统消息
+    QJsonArray messages;
+
+    // 添加系统消息
+    QJsonObject systemMsg;
+    systemMsg["role"]    = "system";
+    systemMsg["content"] = m_defaultPrompt; // 使用用户设置的系统提示词
+    messages.append(systemMsg);
+
+    // 添加历史消息
+    for (const auto& pair : m_conversationHistory) {
+        QJsonObject msg;
+        msg["role"]    = pair.first; // "user" 或 "assistant"
+        msg["content"] = pair.second;
+        messages.append(msg);
+    }
+
+    makeApiRequest(messages);
 }
 
 // 清除历史记录

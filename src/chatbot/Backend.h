@@ -15,6 +15,7 @@
 #include <QObject>
 #include <QQueue>
 #include <QTimer>
+#include <QVector>
 
 #include "common/service/Logger.h"
 
@@ -43,6 +44,8 @@ public:
     Q_INVOKABLE QString markdownToHtml(const QString& markdown); // 将 Markdown 文本转换为 HTML
     Q_INVOKABLE void truncateHistory(int index); // 截断历史记录到指定索引
     Q_INVOKABLE void editMessage(int index, const QString& newContent); // 编辑指定索引的消息
+    Q_INVOKABLE void deleteMessage(int index); // 删除指定索引的单条消息
+    Q_INVOKABLE void regenerateMessage(int index); // 重新生成指定索引的 AI 消息
 
     // 设置获取器
     QString getApiKey() const;
