@@ -35,7 +35,7 @@ Mod::Mod() {
             "PageIndex",
             "Not creatable as it is an enum type."
         );
-
+        
         // 发射属性变更信号，确保 QML 能正确获取初始值
         emit versionChanged();
         emit cachedSymCountChanged();
@@ -168,6 +168,8 @@ PEN_HOOK(bool, license_verify) { return true; }
 
 #include "rime/Backend.h"
 
+#include "plugin/PluginManager.h"
+
 using namespace mod;
 
 __attribute__((constructor)) static void BeforeMain() {
@@ -244,6 +246,9 @@ __attribute__((constructor)) static void BeforeMain() {
 
     // rime
     INSTANCE(rime::Backend)
+
+    // plugin
+    INSTANCE(PluginManager)
 
 #undef INSTANCE
 }
