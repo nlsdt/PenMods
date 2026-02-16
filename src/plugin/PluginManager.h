@@ -10,17 +10,16 @@ namespace mod {
 
 class PluginManager : public QObject, public Singleton<PluginManager>, private Logger {
     Q_OBJECT
-    // 将插件列表暴露给 QML，方便在界面上显示
-    Q_PROPERTY(QList<QObject*> pluginObjects READ pluginObjects NOTIFY pluginsChanged)
-
 public:
     explicit PluginManager();
 
-    // 扫描并尝试加载所有插件
-    void scanAndLoadAll();
+    void                     scanAndLoadAll();
+    Q_INVOKABLE bool         togglePlugin(QString pluginId, bool enable);
+    Q_INVOKABLE bool         uninstallPlugin(QString pluginId);
+    const QList<PluginInfo>& getPlugins() const { return m_plugins; }
 
-    // 从 QML 调用的方法：手动启用某个插件
-    Q_INVOKABLE bool togglePlugin(QString pluginId, bool enable);
+    // 获取特定插件的 QML 入口路径
+    QString getPluginMainQml(const QString& pluginId);
 
 signals:
     void pluginsChanged();
@@ -31,10 +30,7 @@ private:
 
     bool parseMetadata(const QString& path, PluginInfo& info);
     bool loadSo(PluginInfo& info);
-
-    // 用于 QML 显示的包装对象（可选，如果需要更复杂的交互）
-    QList<QObject*> m_pluginObjects;
-    QList<QObject*> pluginObjects() { return m_pluginObjects; }
+    void setPluginPersistence(const PluginInfo& info, bool enable);
 
     friend class Singleton<PluginManager>;
 };
