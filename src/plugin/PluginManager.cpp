@@ -34,10 +34,25 @@ void PluginManager::scanAndLoadAll() {
         QString    fullPath = dir.absoluteFilePath(subDirName);
         PluginInfo info;
         if (parseMetadata(fullPath, info)) {
-            // 检查持久化标记
-            // 约定：如果目录下存在 .disabled 文件，则视为禁用
+            // 检查持久化标记和崩溃标记
             QFile disabledFlag(fullPath + "/.disabled");
-            info.isEnabled = !disabledFlag.exists();
+            QFile loadingFlag(fullPath + "/.loading");
+
+            // --- 崩溃自愈逻辑 ---
+            if (loadingFlag.exists()) {
+                // 发现上一次加载时崩溃了！
+                spdlog::critical("Plugin {} crashed during last startup. Auto-disabling.", info.id.toStdString());
+
+                // 1. 标记为禁用
+                setPluginPersistence(info, false);
+                // 2. 清除加载中标记，防止下次还报崩溃提示
+                loadingFlag.remove();
+
+                info.isEnabled = false;
+            } else {
+                info.isEnabled = !disabledFlag.exists();
+            }
+            // --- 崩溃自愈结束 ---
 
             spdlog::info(
                 "Found plugin: {} (ID: {}, Enabled: {})",
@@ -89,8 +104,18 @@ bool PluginManager::parseMetadata(const QString& path, PluginInfo& info) {
 }
 
 bool PluginManager::loadSo(PluginInfo& info) {
-    QString   soPath = info.path + "/" + info.mainSo;
-    QLibrary* lib    = new QLibrary(soPath);
+    QString soPath          = info.path + "/" + info.mainSo;
+    QString loadingFlagPath = info.path + "/.loading"; // 临时加载标记
+
+    // 1. 准备加载前，先创建标记文件
+    QFile loadingFlag(loadingFlagPath);
+    if (!loadingFlag.open(QIODevice::WriteOnly)) {
+        spdlog::error("Cannot create loading flag for {}", info.id.toStdString());
+        return false;
+    }
+    loadingFlag.close(); // 文件已创建于磁盘
+
+    QLibrary* lib = new QLibrary(soPath);
     // 这里可以把 lib 指针存入 info 或 map 中管理，防止内存泄漏（此处简化）
 
     if (lib->load()) {
@@ -98,6 +123,10 @@ bool PluginManager::loadSo(PluginInfo& info) {
         InitFunc init = (InitFunc)lib->resolve("init_plugin");
         if (init) {
             init();
+
+            // 2. 初始化成功，删除加载标记
+            QFile::remove(loadingFlagPath);
+
             info.isLoaded = true;
             spdlog::info("Successfully loaded SO: {}", info.id.toStdString());
             return true;
@@ -106,6 +135,9 @@ bool PluginManager::loadSo(PluginInfo& info) {
     } else {
         spdlog::error("Failed to load SO: {}, Error: {}", soPath.toStdString(), lib->errorString().toStdString());
     }
+
+    // 如果运行到这里，说明加载失败（但没崩溃）
+    QFile::remove(loadingFlagPath); // 清理标记
     return false;
 }
 
@@ -198,7 +230,7 @@ bool PluginManager::uninstallPlugin(QString pluginId) {
             }
         }
     }
-    
+
     spdlog::error("Plugin not found for uninstallation: {}", pluginId.toStdString());
     return false;
 }
