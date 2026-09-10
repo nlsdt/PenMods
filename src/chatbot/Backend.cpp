@@ -1400,10 +1400,127 @@ void ChatBot::abortActiveReplies() {
     }
 }
 
+namespace {
+
+struct EmbeddedContent {
+    QString answer;
+    QString reasoning;
+};
+
+EmbeddedContent splitEmbeddedContent(const QString& content) {
+    EmbeddedContent result;
+    result.answer = content;
+
+    int       open      = content.indexOf("<think>", 0, Qt::CaseInsensitive);
+    int       tagLength = 7;
+    const int longOpen  = content.indexOf("<thinking>", 0, Qt::CaseInsensitive);
+    if (longOpen >= 0 && (open < 0 || longOpen < open)) {
+        open      = longOpen;
+        tagLength = 10;
+    }
+    if (open < 0) return result;
+
+    int       close       = content.indexOf("</think>", open + tagLength, Qt::CaseInsensitive);
+    int       closeLength = 8;
+    const int longClose   = content.indexOf("</thinking>", open + tagLength, Qt::CaseInsensitive);
+    if (longClose >= 0 && (close < 0 || longClose < close)) {
+        close       = longClose;
+        closeLength = 11;
+    }
+
+    const int reasoningStart  = open + tagLength;
+    const int reasoningLength = close < 0 ? -1 : close - reasoningStart;
+    result.reasoning          = content.mid(reasoningStart, reasoningLength);
+    result.answer             = content.left(open);
+    if (close >= 0) result.answer += content.mid(close + closeLength);
+    return result;
+}
+
+} // namespace
+
 void ChatBot::finishStream() {
     if (m_streamEndEmitted) return;
+    flushEmbeddedContent();
     m_streamEndEmitted = true;
     emit streamEnd();
+}
+
+void ChatBot::emitContentChunk(const QString& content) {
+    if (content.isEmpty()) return;
+
+    // Some OpenAI-compatible providers expose reasoning inside content instead
+    // of reasoning_content. Keep that protocol quirk out of the QML state model.
+    m_embeddedContentBuffer += content;
+    while (!m_embeddedContentBuffer.isEmpty()) {
+        if (m_embeddedReasoningActive) {
+            int       close       = m_embeddedContentBuffer.indexOf("</think>", 0, Qt::CaseInsensitive);
+            int       closeLength = 8;
+            const int longClose   = m_embeddedContentBuffer.indexOf("</thinking>", 0, Qt::CaseInsensitive);
+            if (longClose >= 0 && (close < 0 || longClose < close)) {
+                close       = longClose;
+                closeLength = 11;
+            }
+            if (close < 0) {
+                const int keep     = qMin(m_embeddedContentBuffer.size(), 10);
+                const int emitSize = m_embeddedContentBuffer.size() - keep;
+                if (emitSize > 0) {
+                    const QString reasoning = m_embeddedContentBuffer.left(emitSize);
+                    m_embeddedContentBuffer.remove(0, emitSize);
+                    m_currentReasoningBuffer += reasoning;
+                    emit reasoningChunk(reasoning);
+                }
+                return;
+            }
+            const QString reasoning = m_embeddedContentBuffer.left(close);
+            if (!reasoning.isEmpty()) {
+                m_currentReasoningBuffer += reasoning;
+                emit reasoningChunk(reasoning);
+            }
+            m_embeddedContentBuffer.remove(0, close + closeLength);
+            m_embeddedReasoningActive = false;
+            continue;
+        }
+
+        int open = m_embeddedContentBuffer.indexOf("<think>", 0, Qt::CaseInsensitive);
+        if (open < 0) open = m_embeddedContentBuffer.indexOf("<thinking>", 0, Qt::CaseInsensitive);
+        if (open < 0) {
+            // Retain a possible partial opening tag for the next network chunk.
+            const int keep     = qMin(m_embeddedContentBuffer.size(), 10);
+            const int emitSize = m_embeddedContentBuffer.size() - keep;
+            if (emitSize > 0) {
+                const QString answer = m_embeddedContentBuffer.left(emitSize);
+                m_embeddedContentBuffer.remove(0, emitSize);
+                m_currentStreamBuffer += answer;
+                emit streamChunk(answer);
+            }
+            return;
+        }
+
+        if (open > 0) {
+            const QString answer = m_embeddedContentBuffer.left(open);
+            m_embeddedContentBuffer.remove(0, open);
+            m_currentStreamBuffer += answer;
+            emit streamChunk(answer);
+            continue;
+        }
+
+        const bool longTag = m_embeddedContentBuffer.startsWith("<thinking>", Qt::CaseInsensitive);
+        m_embeddedContentBuffer.remove(0, longTag ? 10 : 7);
+        m_embeddedReasoningActive = true;
+    }
+}
+
+void ChatBot::flushEmbeddedContent() {
+    if (m_embeddedContentBuffer.isEmpty()) return;
+    const QString remaining = m_embeddedContentBuffer;
+    m_embeddedContentBuffer.clear();
+    if (m_embeddedReasoningActive) {
+        m_currentReasoningBuffer += remaining;
+        emit reasoningChunk(remaining);
+    } else {
+        m_currentStreamBuffer += remaining;
+        emit streamChunk(remaining);
+    }
 }
 
 void ChatBot::makeApiRequest(const QJsonArray& messages) {
@@ -1477,16 +1594,17 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     QNetworkReply* reply = m_networkManager->post(request, requestData);
     m_activeReplies.append(reply);
 
-    if (m_isStreaming) {
-        m_currentStreamBuffer.clear();
-        m_responseBuffer.clear();
-        m_toolCallsBuffer.clear();
-        m_responseToolItemIndexes.clear();
-        m_serverToolCallActive = false;
-        m_serverToolCallName.clear();
-        m_currentReasoningBuffer.clear();
-        emit streamStart();
-    }
+    m_currentStreamBuffer.clear();
+    m_currentReasoningBuffer.clear();
+    m_embeddedContentBuffer.clear();
+    m_embeddedReasoningActive = false;
+    m_responseBuffer.clear();
+    m_toolCallsBuffer.clear();
+    m_responseToolItemIndexes.clear();
+    m_serverToolCallActive = false;
+    m_serverToolCallName.clear();
+
+    if (m_isStreaming) emit streamStart();
 
     connect(reply, &QNetworkReply::finished, this, [this, reply, seq]() {
         if (seq != m_requestSeq) {
@@ -1531,6 +1649,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
 
                 QString jsonData = trimmedLine.mid(6);
                 if (jsonData.trimmed() == "[DONE]") {
+                    flushEmbeddedContent();
                     if (m_serverToolCallActive) {
                         emit toolCallProgress(
                             QString("已完成：%1")
@@ -1589,11 +1708,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                 if (usesResponsesApi()) {
                     const QString eventType = obj["type"].toString();
                     if (eventType == "response.output_text.delta") {
-                        const QString content = obj["delta"].toString();
-                        if (!content.isEmpty()) {
-                            emit streamChunk(content);
-                            m_currentStreamBuffer += content;
-                        }
+                        emitContentChunk(obj["delta"].toString());
                     } else if (
                         eventType == "response.reasoning_summary_text.delta"
                         || eventType == "response.reasoning_text.delta"
@@ -1696,17 +1811,16 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                                 emit reasoningChunk(reasoning);
                             }
                         }
+                        flushEmbeddedContent();
                         if (m_currentStreamBuffer.isEmpty()) {
                             const QString content = responseOutputText(output);
-                            if (!content.isEmpty()) {
-                                m_currentStreamBuffer = content;
-                                emit streamChunk(content);
-                            }
+                            if (!content.isEmpty()) emitContentChunk(content);
+                            flushEmbeddedContent();
                         }
 
                         if (m_currentStreamBuffer.isEmpty() && !generatedImages.isEmpty()) {
-                            m_currentStreamBuffer = "已生成图片";
-                            emit streamChunk(m_currentStreamBuffer);
+                            emitContentChunk("已生成图片");
+                            flushEmbeddedContent();
                         }
 
                         QString toolCallsJson = responseOutputToolCalls(output);
@@ -1771,11 +1885,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                 }
 
                 if (delta.contains("content") && delta["content"].isString()) {
-                    QString content = delta["content"].toString();
-                    if (!content.isEmpty()) {
-                        emit streamChunk(content);
-                        m_currentStreamBuffer += content;
-                    }
+                    emitContentChunk(delta["content"].toString());
                 }
 
                 if (delta.contains("tool_calls") && delta["tool_calls"].isArray()) {
@@ -1817,6 +1927,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
 void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
     if (reply->error() == QNetworkReply::NoError) {
         if (isStream) {
+            flushEmbeddedContent();
             if (!m_toolCallsBuffer.isEmpty()) {
                 json tcArr = json::array();
                 for (auto it = m_toolCallsBuffer.constBegin(); it != m_toolCallsBuffer.constEnd(); ++it)
@@ -1881,7 +1992,13 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 const QVector<MessagePart> generatedImages = persistGeneratedImages(output);
                 const QString              toolCallsJson   = responseOutputToolCalls(output);
                 QString                    content         = responseOutputText(output);
-                const QString              reasoning       = responseOutputReasoning(output);
+                QString                    reasoning       = responseOutputReasoning(output);
+                const EmbeddedContent      embedded        = splitEmbeddedContent(content);
+                content                                    = embedded.answer;
+                if (!embedded.reasoning.isEmpty()) {
+                    if (!reasoning.isEmpty()) reasoning += "\n";
+                    reasoning += embedded.reasoning;
+                }
                 if (content.isEmpty() && !generatedImages.isEmpty()) content = "已生成图片";
                 if (!m_cancelled && !reasoning.isEmpty()) emit reasoningChunk(reasoning);
                 if (!m_cancelled && !toolCallsJson.isEmpty() && toolCallsJson != "[]") {
@@ -1930,9 +2047,14 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 return;
             }
 
-            QJsonObject   choice    = choices.first().toObject();
-            QJsonObject   message   = choice["message"].toObject();
-            const QString reasoning = message["reasoning_content"].toString(message["reasoning"].toString());
+            QJsonObject           choice    = choices.first().toObject();
+            QJsonObject           message   = choice["message"].toObject();
+            QString               reasoning = message["reasoning_content"].toString(message["reasoning"].toString());
+            const EmbeddedContent embedded  = splitEmbeddedContent(message["content"].toString());
+            if (!embedded.reasoning.isEmpty()) {
+                if (!reasoning.isEmpty()) reasoning += "\n";
+                reasoning += embedded.reasoning;
+            }
             if (!m_cancelled && !reasoning.isEmpty()) emit reasoningChunk(reasoning);
 
             if (message.contains("tool_calls") && message["tool_calls"].isArray()) {
@@ -1941,7 +2063,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 MessageData   assistantMsg;
                 assistantMsg.role = "assistant";
                 if (!m_cancelled) {
-                    assistantMsg.content   = message["content"].toString();
+                    assistantMsg.content   = embedded.answer;
                     assistantMsg.reasoning = reasoning;
                 }
                 assistantMsg.toolCallsJson = toolCallsJson;
@@ -1954,7 +2076,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 }
                 dispatchToolCalls(toolCallsJson);
             } else if (message.contains("content") && message["content"].isString()) {
-                QString content = message["content"].toString();
+                const QString content = embedded.answer;
                 if (!m_cancelled) {
                     MessageData assistantMsg;
                     assistantMsg.role      = "assistant";
@@ -2129,6 +2251,8 @@ void ChatBot::cancelRequest() {
 
     m_currentStreamBuffer.clear();
     m_currentReasoningBuffer.clear();
+    m_embeddedContentBuffer.clear();
+    m_embeddedReasoningActive = false;
     m_responseBuffer.clear();
     m_toolCallsBuffer.clear();
     m_responseToolItemIndexes.clear();
