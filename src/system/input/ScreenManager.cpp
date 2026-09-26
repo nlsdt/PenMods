@@ -15,6 +15,7 @@
 #include "common/Event.h"
 
 #include <QQmlContext>
+#include <QDebug>
 
 namespace mod {
 
@@ -23,6 +24,7 @@ ScreenManager::ScreenManager() {
     mCfg = Config::getInstance().read(mClassName);
 
     mAutoSleepDuration    = mCfg["sleep_duration"];
+    mAutoShutdownDuration  = mCfg.value("shutdown_duration", 0);
     mIntelSleep           = mCfg["intel_sleep"];
     mIntelSleepAudioLock  = mCfg["intel_sleep_audio_lock"];
 
@@ -30,7 +32,17 @@ ScreenManager::ScreenManager() {
         context->setContextProperty("screenManager", this);
     });
 
+    connect(&Event::getInstance(), &Event::currentPageIndexChanged, this, [this](int) {
+        resetInactivityTimer();
+    });
+    connect(&Event::getInstance(), &Event::ocrStarted, this, [this]() {
+        resetInactivityTimer();
+    });
+
     connect(&AudioDaemon::getInstance(), &AudioDaemon::stateChanged, this, &ScreenManager::onAudioDaemonStateChanged);
+    mInactivityTimer.setSingleShot(true);
+    connect(&mInactivityTimer, &QTimer::timeout, this, &ScreenManager::requestPowerOff);
+    if (mAutoShutdownDuration > 0) mInactivityTimer.start(mAutoShutdownDuration * 1000);
 }
 
 void ScreenManager::onPlayStateChanged(PlayState state) {
@@ -50,6 +62,7 @@ void ScreenManager::onInPlayerPageChanged(bool in) {
 
 // Dynamic Actions
 void ScreenManager::reportAction(const QString& action) {
+    resetInactivityTimer();
     if (!getIntelSleep()) {
         return;
     }
@@ -67,6 +80,46 @@ void ScreenManager::reportAction(const QString& action) {
         onLrcShowChanged(false);
         break;
     }
+}
+
+QString ScreenManager::getAutoShutdownDurationStr() const {
+    if (mAutoShutdownDuration == 0) return "关闭";
+    return QString::number(mAutoShutdownDuration / 60) + "分钟";
+}
+
+void ScreenManager::setAutoShutdownDurationStr(const QString& str) {
+    int duration = 0;
+    if (str != "关闭") {
+        duration = str.left(str.indexOf("分钟")).toInt() * 60;
+    }
+    if (duration == mAutoShutdownDuration) return;
+    mAutoShutdownDuration = duration;
+    mCfg["shutdown_duration"] = duration;
+    WRITE_CFG;
+    resetInactivityTimer();
+    emit autoShutdownDurationChanged();
+}
+
+void ScreenManager::setSystemBase(YSystemBase* systemBase) {
+    if (mSystemBase == nullptr && systemBase != nullptr) {
+        mSystemBase = systemBase;
+        qInfo() << "captured YSystemBase instance";
+    }
+}
+
+void ScreenManager::resetInactivityTimer() {
+    if (mAutoShutdownDuration > 0) mInactivityTimer.start(mAutoShutdownDuration * 1000);
+    else mInactivityTimer.stop();
+}
+
+void ScreenManager::requestPowerOff() {
+    qInfo() << "inactivity shutdown timer expired";
+    if (mSystemBase == nullptr) {
+        qWarning() << "cannot power off: YSystemBase is not captured";
+        return;
+    }
+    qInfo() << "calling YSystemBase::powerOff()";
+    PEN_CALL(void*, "_ZN11YSystemBase8powerOffEv", void*)(mSystemBase);
 }
 
 QString ScreenManager::getAutoSleepDurationStr() const {
@@ -147,6 +200,11 @@ void ScreenManager::rtSetAutoScreenOff(bool val) {
 } // namespace mod
 
 // MusicPlayer
+PEN_HOOK(void*, _ZN11YSystemBase16onPowerLongPressEv, void* self) {
+    mod::ScreenManager::getInstance().setSystemBase(reinterpret_cast<YSystemBase*>(self));
+    return origin(self);
+}
+
 PEN_HOOK(uint64, _ZN7YGlobal27isInPlayerCenterPageChangedEv, uint64 self, uint64 a2, uint64 a3, uint64 a4, uint64 a5) {
     bool isInPage = PEN_CALL(bool, "_ZNK7YGlobal20isInPlayerCenterPageEv", uint64)(self);
     mod::ScreenManager ::getInstance().onInPlayerPageChanged(isInPage);
@@ -154,6 +212,7 @@ PEN_HOOK(uint64, _ZN7YGlobal27isInPlayerCenterPageChangedEv, uint64 self, uint64
     if (!isInPage) {
         mod::filemanager::MusicPlayer::getInstance().cleanupTempSymlinks();
     }
+    mod::ScreenManager::getInstance().resetInactivityTimer();
     return origin(self, a2, a3, a4, a5);
 }
 
@@ -166,7 +225,7 @@ PEN_HOOK(
     uint64 a4,
     uint64 a5
 ) {
-    mod::ScreenManager ::getInstance().onPlayStateChanged(
+    mod::ScreenManager::getInstance().onPlayStateChanged(
         PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", uint64)(self)
     );
     return origin(self, a5, a2, a3, a4);

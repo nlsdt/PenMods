@@ -14,6 +14,7 @@
 #include "mod/Config.h"
 
 #include "system/sound/AudioDaemon.h"
+#include "system/input/ScreenManager.h"
 
 #include <QFile>
 #include <QQmlContext>
@@ -31,6 +32,11 @@ MusicPlayer::MusicPlayer() : Logger("MusicPlayer") {
     mHideFloatingWindow = cfg.value("hide_floating_window", false);
 
     connect(&Event::getInstance(), &Event::ocrStarted, this, &MusicPlayer::onOcrStarted);
+    connect(&mShutdownTimer, &QTimer::timeout, this, [this]() {
+        // 倒计时结束：定时关机；"播放结束关机" 模式不使用该定时器（见 setShutdownAfterPlaylist）。
+        mShutdownTimerMinutes = 0;
+        ScreenManager::getInstance().requestPowerOff();
+    });
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("musicPlayer", this);
     });
@@ -225,6 +231,13 @@ void MusicPlayer::clickRand() {
 
 void MusicPlayer::onSoundEnd() {
     mCurrentPlaying.mIsEnd = true;
+    if (mShutdownPending && getCurrentAudioSequence() == AudioSequence::ORDER
+        && mCurrentPlaying.mIndex + 1 >= mPlayList.size()) {
+        mShutdownPending = false;
+        ScreenManager::getInstance().requestPowerOff();
+        emit shutdownTimerChanged();
+        return;
+    }
     switch (getCurrentAudioSequence()) {
     case AudioSequence::ORDER:
         clickNext();
@@ -273,6 +286,39 @@ void MusicPlayer::setHideFloatingWindow(bool hidden) {
     cfg["hide_floating_window"] = hidden;
     Config::getInstance().write("fm", std::move(cfg));
     emit hideFloatingWindowChanged();
+}
+
+void MusicPlayer::setShutdownAfterPlaylist(bool enabled) {
+    if (mShutdownAfterPlaylist == enabled) return;
+    mShutdownAfterPlaylist = enabled;
+    if (enabled) {
+        // "播放结束关机" 不是倒计时模式：停止并清空定时器，立即进入等待播放列表结束的状态，
+        // 这样顺序播放到最后一首结束时 onSoundEnd() 才会执行关机。
+        mShutdownTimer.stop();
+        mShutdownTimerMinutes = 0;
+        mShutdownPending      = true;
+    } else {
+        mShutdownPending = false;
+    }
+    emit shutdownTimerChanged();
+}
+
+void MusicPlayer::setShutdownTimerMinutes(int minutes) {
+    if (minutes <= 0) {
+        cancelShutdownTimer();
+        return;
+    }
+    mShutdownPending = false;
+    mShutdownTimerMinutes = minutes;
+    mShutdownTimer.start(minutes * 60 * 1000);
+    emit shutdownTimerChanged();
+}
+
+void MusicPlayer::cancelShutdownTimer() {
+    mShutdownTimer.stop();
+    mShutdownPending = false;
+    mShutdownTimerMinutes = 0;
+    emit shutdownTimerChanged();
 }
 
 void MusicPlayer::onOcrStarted() {

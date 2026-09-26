@@ -22,9 +22,10 @@ class MusicPlayer : public QObject, public Singleton<MusicPlayer>, private Logge
     Q_OBJECT
 
     Q_PROPERTY(bool pauseOnScan READ getPauseOnScan WRITE setPauseOnScan NOTIFY pauseOnScanChanged);
-    Q_PROPERTY(
-        bool hideFloatingWindow READ getHideFloatingWindow WRITE setHideFloatingWindow NOTIFY hideFloatingWindowChanged
-    );
+    Q_PROPERTY(bool hideFloatingWindow READ getHideFloatingWindow WRITE setHideFloatingWindow NOTIFY hideFloatingWindowChanged);
+    Q_PROPERTY(bool shutdownTimerEnabled READ shutdownTimerEnabled NOTIFY shutdownTimerChanged);
+    Q_PROPERTY(int shutdownTimerMinutes READ shutdownTimerMinutes NOTIFY shutdownTimerChanged);
+    Q_PROPERTY(bool shutdownAfterPlaylist READ shutdownAfterPlaylist WRITE setShutdownAfterPlaylist NOTIFY shutdownTimerChanged);
 
 public:
     void play(size_t idx);
@@ -56,6 +57,7 @@ public:
     [[nodiscard]] bool getHideFloatingWindow() const;
     void setHideFloatingWindow(bool hidden);
 
+
     /// 供 QML 调用：将当前音频定位到指定的毫秒位置
     Q_INVOKABLE void seekToPosition(qint64 position);
 
@@ -67,6 +69,12 @@ public:
 
     /// 页面导航隐藏播放器时，保留由扫描暂停的播放会话
     Q_INVOKABLE void releaseAudioAfterHide();
+    Q_INVOKABLE void setShutdownTimerMinutes(int minutes);
+    Q_INVOKABLE void cancelShutdownTimer();
+    bool shutdownTimerEnabled() const { return mShutdownTimer.isActive() || mShutdownPending; }
+    int shutdownTimerMinutes() const { return mShutdownTimerMinutes; }
+    bool shutdownAfterPlaylist() const { return mShutdownAfterPlaylist; }
+    void setShutdownAfterPlaylist(bool enabled);
 
     /// 清理当前临时软链接
     void cleanupTempSymlinks();
@@ -74,6 +82,7 @@ public:
 signals:
     void pauseOnScanChanged();
     void hideFloatingWindowChanged();
+    void shutdownTimerChanged();
     void stopRequested();
 
 private:
@@ -104,6 +113,10 @@ private:
     QString mTempAudioLink;
     bool    mPauseOnScan{false};
     bool    mHideFloatingWindow{false};
+    QTimer  mShutdownTimer;
+    int     mShutdownTimerMinutes{0};
+    bool    mShutdownPending{false};
+    bool    mShutdownAfterPlaylist{false};
     bool    mPausedByScan{false};
     bool    mPlaybackResumedDuringScan{false};
     bool    mScanResultClosed{false};

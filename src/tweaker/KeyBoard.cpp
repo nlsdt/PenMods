@@ -8,6 +8,7 @@
 
 #include "common/Event.h"
 #include "mod/Config.h"
+#include "system/input/ScreenManager.h"
 
 #include "base/YPointer.h"
 
@@ -96,6 +97,7 @@ PEN_HOOK(bool, _ZN11YSystemBase12onScanFinishERK7QStringi, uint64 self, QString 
 }
 
 PEN_HOOK(uint64, _ZN11YSystemBase8ocrStartEv, uint64 self, uint64 a2, uint64 a3, uint64 a4, uint64 a5) {
+    mod::ScreenManager::getInstance().setSystemBase(reinterpret_cast<YSystemBase*>(self));
     const bool isButtonRelease =
         PEN_CALL(bool, "_ZNK11YSystemBase15isButtonReleaseEv", void*)(reinterpret_cast<void*>(self));
     if (!isButtonRelease) {

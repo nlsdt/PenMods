@@ -86,6 +86,7 @@ Config::Config() : Logger("Config") {
         }},
         {"screen", {
             {"sleep_duration", 30},
+            {"shutdown_duration", 0},
             {"intel_sleep", false},
             {"intel_sleep_audio_lock", false}
         }},
