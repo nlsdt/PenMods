@@ -111,6 +111,7 @@ persisted as `righthandmode` in `/userdata/DictPenData/NeteaseYoudao/YoudaoDictP
 | `src/common/` | Event bus, Config, Utils, Downloader, Singleton base |
 | `src/mod/` | Entry point (Mod.cpp), Engine, version info, OTA updater |
 | `src/tweaker/` | Feature flags, DB limit patches, wordbook tweaks, keyboard |
+| `src/dict/` | Custom dictionaries (`customDict`): scans `/userdisk/PenMods/dicts/`, queries user-made `.dat` containers through the vendor reader and injects the hit into the main result page as its own section (see `doc/DICT_FORMAT_ANALYSIS.md`) |
 | `src/filemanager/` | File browser, MusicPlayer, VideoPlayer, TextReader, ImageViewer |
 | `src/helper/` | AntiEmbs, NetworkSettings, DeveloperSettings, ServiceManager |
 | `src/system/` | BatteryInfo, InputDaemon, ScreenManager, AudioDaemon |
@@ -129,7 +130,8 @@ persisted as `righthandmode` in `/userdata/DictPenData/NeteaseYoudao/YoudaoDictP
 
 ### QML Integration
 
-Package `com.github.penuniverse` (1.0). Context properties registered in Engine.cpp or constructors: `mod`, `musicPlayer`, `videoPlayer`, `textReader`, `fileManager`, `imageViewer`, `workBookTweaks`, `queryTweaks`, `columnDb`, `batteryInfo`, `locker`, `wallpaperManager`, `mediaSession`. `PageIndex` and `MediaSession` are uncreatable enum types. **All QML must fit 320×170 touchscreen** — prefer Youdao custom components over stock QML.
+Package `com.github.penuniverse` (1.0). Context properties registered in Engine.cpp or constructors: `mod`, `musicPlayer`, `videoPlayer`, `textReader`, `fileManager`, `imageViewer`, `workBookTweaks`, `queryTweaks`, `columnDb`, `batteryInfo`, `locker`, `wallpaperManager`, `mediaSession`,
+`customDict`. `PageIndex` and `MediaSession` are uncreatable enum types. **All QML must fit 320×170 touchscreen** — prefer Youdao custom components over stock QML.
 
 ### QML Resource Workflow
 
@@ -172,6 +174,19 @@ Plugins live in `/userdisk/PenMods/plugins/<id>/` with `metadata.json` and optio
   session exists at a time; without one the panel reads the host `mediaPlayerManager`, so the host path is unaffected.
   `YQuickMusicPlayer.qml` / `YQuickSettingLayer.qml` implement that fallback, and `PluginManager::unloadSo()` releases a
   plugin's session (and clears its C ABI callbacks) when it is disabled. See `doc/PLUGIN_DEV_GUIDE.md`.
+  A session belongs to the plugin id passed to `begin()`: keep `end(pluginId)` (owner-checked, no-op for a revoked
+  owner) as the plugin-facing release, and keep the `mRevoking` guard around the `sessionRevoked` emit — a takeover
+  must not let the previous owner's `end()` tear down the incoming session. A takeover also fires
+  `PluginMediaCallbacks::onSessionRevoked` (an additive, `structSize`-gated field) for the C ABI, since a C plugin's
+  handle is invalidated by the takeover and no later status call reaches the panel.
+- The C ABI session handle is a monotonically increasing integer token encoded in the `void*`, never a pointer: a
+  takeover used to `delete`/`new` the handle object, the allocator handed back the same address, and the stale handle
+  from the revoked plugin still passed the liveness check. Keep tokens non-reusable.
+- **All C ABI state lives in the function-local `state()` singleton in `MediaSession.cpp`.** `init_plugin*` runs inside
+  `BeforeMain()`, which can execute before this library's own static initializers; a file-scope `QString` (or any
+  non-trivially-constructed object) is still null there and dereferences to a crash. Never move that state back to
+  namespace scope. Panel visibility is exactly
+  `mediaSession.active`, so a `Stopped` session keeps its card (that is the intended resume path); do not auto-expire it.
 
 ### Keyboard & Rime
 
@@ -195,6 +210,89 @@ so it never learns about left/right hand mode; the mod passes `--video-rotate=18
 rotates the video frame only — subtitles/OSD are composited by the VO afterwards and stay unrotated (add `--vf=sub` to
 render them into the frame before the autorotate post-filter if that ever needs to change).
 
+## Experimental OCR Backend (PP-OCRv5)
+
+`tools/ppocr-backend/` holds an **opt-in, off-by-default** replacement for the pen's line
+recognition stage: PaddleOCR's PP-OCRv5 mobile recognizer on ncnn. Read
+`doc/PPOCR_BACKEND_ANALYSIS.md` for the reverse engineering and measurements, and the
+tool's `README.md` for the how-to. Nothing in `src/` (and therefore nothing in the xmake
+build) depends on it.
+
+- The vendor OCR lives in `/oem/YoudaoDictPen/output/aarch64_libs/libyocr.so` (ncnn + Eigen +
+an FST decoder) with models in `../ocr_model/`. Detection and line segmentation are **not** there —
+they are inside `libYoudaoStitch.so` (`seg_middle_line`/`SegLine`), so replacing `libyocr.so`
+leaves the whole scan pipeline otherwise intact. The shipped app never enables the 150 MB FST
+language model, so the vendor path is greedy decoding and a greedy-vs-greedy comparison is fair.
+- `libYoudaoStitch.so` imports exactly six symbols from `libyocr.so`; the shim re-implements
+them. Do **not** try to hook `yocr_recognize(cv::Mat const&)` from PenMods: its `std::string` /
+`cv::Mat` parameters are libstdc++/OpenCV C++ ABI, while libPenMods.so is libc++ (zig).
+- The shim must be built with an `aarch64-linux-gnu-g++` whose sysroot is glibc 2.27 and which
+ships `omp.h`/`libgomp`, and must link libstdc++ **dynamically**. zig cannot be used: it defines
+`_OPENMP` but has no OpenMP runtime, so every ncnn layer loses its `#pragma omp parallel for`
+and the model runs single-threaded (measured 3.8x slower).
+- Invariants baked into the shim, each of which cost a debugging session: OpenCV encodes the
+channel count as `cn-1`; a crop can be a non-continuous ROI so rows must be walked with
+`step.p[0]`; the network has one output class beyond the dictionary (the space) and dropping it
+concatenates English words; and a crop's height is already ~48 before we see it, so lowering
+`target_h` is a second resample that costs dense-Chinese accuracy (knob: `/userdisk/ppocr_target_h`).
+- The backend is toggled either from the shell (`penmods-ppocr.sh`, or `scripts/deploy.sh` while
+developing) or from the mod's settings page (**更多设置 → 系统调整 → 实验性功能**, backed by
+`src/tweaker/OcrBackend.cpp` / context property `ocrBackend`). Both read the same three files
+(`/userdisk/ppocr_backend`, `/userdisk/Qtlib/libyocr.so`, `/userdisk/ppocr_target_h`) — keep it
+that way instead of adding a config key that can drift out of sync with reality. Enabling or
+disabling has to restart the app; the accuracy/speed knob does not.
+- Deployment shadows the vendor library via the app's own `LD_LIBRARY_PATH`
+(`/userdisk/Qtlib/` is its first entry and does not otherwise exist). `scripts/deploy.sh on|off`
+handles install/revert, including a loader pre-flight (`LD_TRACE_LOADED_OBJECTS`) before the app
+is restarted. Never `adb push` over that file while the app runs — see the section below.
+
+## Device Deployment & Recovery
+
+### Deploying a new `libPenMods.so` / plugin `.so`
+
+`libPenMods.so` reaches the app through a `NEEDED` entry on `YoudaoDictPen` (see `/userdisk/penmods/patch.sh`), so a
+running app has it mapped. Overwriting it in place (`adb push` directly onto `/userdata/PenMods/libPenMods.so`) mutates
+pages of a live mapping and makes the app execute mismatched code — it segfaults, the guardian restarts it, and the
+firmware escalates a few crashes in a row into a `misc` `boot-recovery` reboot, leaving the device in the Rockchip
+recovery ramdisk. Push to a scratch name and rename instead, which leaves the running process on the old inode:
+
+```sh
+adb push build/linux/arm64-v8a/release/libPenMods.so /userdata/PenMods/libPenMods.tmp.so
+adb shell 'mv -f /userdata/PenMods/libPenMods.tmp.so /userdata/PenMods/libPenMods.so'
+```
+
+The same applies to an already-loaded plugin `.so` under `/userdisk/PenMods/plugins/<id>/`. After the rename, restart
+the app (`killall YoudaoDictPen`) to pick the new file up.
+
+Recovering a device already stuck there needs `adb shell auth`, a `misc` reflash and a reboot — see
+[Recovering from a crash loop → recovery](#recovering-from-a-crash-loop--recovery).
+
+### Recovering from a crash loop → recovery
+
+Symptom: ADB reconnects with the device in a ramdisk root (`rootfs on / type rootfs`, only `/userdata` + `/userdisk`
+mounted) and every `adb shell` answers `login with "adb shell auth" to continue.`. `YoudaoDictPen` is not running and
+`/userdata/syslog/messages` holds repeated `unhandled level 2 translation fault ... Comm: YoudaoDictPen` dumps. The
+firmware wrote `boot-recovery` + `recovery --recovery_online` into the BCB at offset `0x4000` of `/dev/block/by-name/misc`.
+
+`system_a` itself is fine — do not "repair" it. Mount it read-only only to confirm, then run:
+
+```sh
+adb shell auth                      # password: CherryYoudao
+# remove whatever caused the crash first, e.g. the offending plugin dir
+adb shell 'rm -rf /userdisk/PenMods/plugins/<id>'
+# restore a good library from a copy you kept as /userdata/PenMods/libPenMods.known_good.so
+adb shell 'cp -f /userdata/PenMods/libPenMods.known_good.so /userdata/PenMods/libPenMods.so'
+# clear the boot marker with the known-good misc image kept on the device
+adb shell 'dd if=/userdisk/Music/OTHERS/misc.img of=/dev/block/by-name/misc bs=4096 conv=fsync; sync'
+adb shell 'md5sum /dev/block/by-name/misc'   # must be 50e0f9d40f6912cbff7ac89b7862ab4c
+adb shell 'reboot'
+```
+
+`loadSo()` keeps the `.loading` marker until `init_plugin`, `attach_engine`, `init_plugin_with_hook_api` and
+`init_plugin_with_media_api` have all returned, so a crash in any of them is covered by the crash self-heal (the plugin
+is auto-disabled on the next start). Keep that ordering: removing the marker earlier turns any init crash into an
+infinite crash loop, which the firmware escalates into a `misc` `boot-recovery` reboot.
+
 ## Deployment Paths (on-device)
 
 | Path | Content |
@@ -206,6 +304,142 @@ render them into the frame before the autorotate post-filter if that ever needs 
 | `/userdata/applog/DictPen_<timestamp>.log` | `YoudaoDictPen` stdout: spdlog + QML `console.log` |
 | `/tmp/rime/` | librime logs |
 | `/userdisk/Music/Rime/` | Rime user/shared data dir |
+
+## Release & OTA Update
+
+PenMods is distributed via OTA from the separate repo `Lyrecoul/penmods-ota`, whose manifest is fetched by
+`src/mod/Updater.cpp` (`UH_MAIN_URL = https://cdn.jsdelivr.net/gh/lyrecoul/penmods-ota@main/updates.json`).
+Releasing touches three places: the version in this repo, a release tag here, and a new package + tag in the OTA repo.
+
+### Versioning
+
+- The version is the single `set_version('X.Y.Z')` in `xmake.lua`. Nothing else hard-codes it: `src/mod/Version.h.in`
+  is templated at configure time into `build/config/Version.h` (`VERSION_MAJOR/MINOR/ALTER`).
+- `VERSION_STRING` becomes `X.Y.Z` (`Mod::getVersionStr()`, and the updater's `mSelfVersion`), while `VERSION_CONFIG`
+  is the digits concatenated (e.g. `2.3.0` → `230`) and drives config migration in `src/mod/Config.cpp`.
+- `BUILD_INFO_STRING` prints a literal `[BUILD_CHANNEL]`: the template only substitutes `VERSION_*`/`MODE`/`GIT_COMMIT`,
+  so `VERSION_TO_STRING(BUILD_CHANNEL)` stringifies the macro name instead of its value. Do not rely on it to tell a
+  channel/`--target-channel` build apart.
+
+### 1. Bump and tag this repo
+
+```sh
+git add xmake.lua
+git commit -m "chore(release): bump version to X.Y.Z"
+git tag -a VX.Y.Z -m "VX.Y.Z"        # main repo uses an UPPERCASE V
+git push origin main
+git push origin VX.Y.Z
+```
+
+### 2. Build the release artifact
+
+Build **release with no `--force-debug-log`** (that flag forces spdlog to debug level and is only for on-device
+debugging; `.github/workflows/build.yaml` likewise omits it). The build must run outside the sandbox — see
+`Commands That Must Run Outside the Sandbox`. A stale `/tmp` Zig wrapper is fixed by re-running `xmake f`.
+
+```sh
+xmake f --qt="$HOME/PenMods/aarch64-linux-qt-5.15.2" --arch=arm64-v8a --build-platform=YDP02X \
+  --target-channel=dev --toolchain=zig -m release -vD \
+  --cross=aarch64-linux-gnu.2.27 --force-debug-log=false -c
+xmake build PenMods
+# verify: strings -a build/linux/arm64-v8a/release/libPenMods.so | grep -E '^X\.Y\.Z$'
+```
+
+### 3. Package into the OTA repo
+
+Clone `git@github.com:Lyrecoul/penmods-ota.git`. Its layout:
+
+| Path | Content |
+|---|---|
+| `updates.json` | Manifest served at jsDelivr `@main` (the URL the updater fetches) |
+| `template/_do_update.sh` | On-device installer: remounts `/` rw, copies `libPenMods.so` to `/userdata/PenMods/`, touches `INSTALL_SUCCESSFULLY` |
+| `template/libPenMods.so` | Staging copy of the current release `.so` |
+| `update_vX.Y.Z.zip` | The published archive: `_do_update.sh` + `libPenMods.so` at the **archive root** (no top-level dir) |
+
+The OTA repo tags with a **lowercase** `v` (`v2.0.0`, `v2.3.0`) — distinct from this repo's `VX.Y.Z`.
+
+`zip` is not installed on the maintainer host; build the archive with Python instead:
+
+```sh
+cp build/linux/arm64-v8a/release/libPenMods.so <ota>/template/libPenMods.so
+python3 - <<'PY'
+import zipfile, os, hashlib
+os.chdir('<ota>')
+zp = 'update_vX.Y.Z.zip'
+with zipfile.ZipFile(zp, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+    for name in ('_do_update.sh', 'libPenMods.so'):
+        zi = zipfile.ZipInfo(name)
+        zi.external_attr = (0o755 if name.endswith('.sh') else 0o644) << 16
+        z.writestr(zi, open(os.path.join('template', name), 'rb').read())
+print(os.path.getsize(zp), hashlib.md5(open(zp, 'rb').read()).hexdigest())
+PY
+```
+
+Then add an entry to `updates.json` (`size`/`md5` are those of the **zip**, not the `.so`):
+
+```json
+{
+  "version": [X, Y, Z],
+  "note": "中文更新说明，显示在设备的升级弹窗中",
+  "size": <zip bytes>,
+  "download": "https://cdn.jsdelivr.net/gh/lyrecoul/penmods-ota@vX.Y.Z/update_vX.Y.Z.zip",
+  "md5": "<zip md5>"
+}
+```
+
+### jsDelivr refresh discipline (skip this and every release stalls)
+
+- The device fetches `@main/updates.json` and jsDelivr serves it with `cache-control: public,
+  max-age=604800, s-maxage=43200` — a **12 hour CDN TTL, cached independently per edge node**. So
+  after a release, "one device sees the new version while another does not" is expected behaviour
+  and not a failed publish.
+- `purge.jsdelivr.net` is the only way to make it immediate, and it is **rate limited per path**:
+  after a few calls it answers `"throttled": true` with a `throttlingReset` countdown (a ~3300 s
+  rolling window). **Changing IP does not reset it** — the limit follows the path, not the caller
+  (measured: five purges of the same path, after which every purge inside the window is refused).
+- Therefore purge **exactly once per release**, right after the push. If it is already throttled,
+  wait for the window or for the 12 h TTL.
+- Judge a release from GitHub and the **tagged artifact URL** (`@vX.Y.Z/update_*.zip` is a brand new
+  path, immune to any cache, and its md5 must match the manifest) — never from the `@main` response.
+- A query string (`?cb=123`) does **not** bust the jsDelivr cache; do not rely on it.
+- (Alternative: host `updates.json` on `raw.githubusercontent.com`, whose TTL is only 5 minutes, but
+  its reachability from mainland China is uncertain; doing it properly means giving `Updater`
+  multiple URL fallbacks. Not done for now.)
+
+Manifest rules enforced by `Updater::check()`: every entry the device may be running must be listed, otherwise the
+check aborts with `Cannot get self version from mod_versions`; keep older entries alongside new ones. An optional
+`"next": [X, Y, Z]` on an entry forces the upgrade path to that version instead of the highest in the list.
+`download` must point at a jsDelivr URL whose `md5` matches, and `src/mod/Updater.cpp` validates the md5 before running
+`_do_update.sh`.
+
+```sh
+git add -A
+git commit -m "release: add vX.Y.Z"
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin main
+git push origin vX.Y.Z
+```
+
+### 4. Verify through the CDN
+
+jsDelivr caches **versioned paths permanently (~1 year)**, so the manifest and the artifact can lag a push by seconds
+to minutes even though GitHub already has them.
+
+```sh
+# manifest the device actually fetches; must list the new version and its md5
+curl -sL https://cdn.jsdelivr.net/gh/lyrecoul/penmods-ota@main/updates.json
+# artifact must exist and match the manifest md5 (note: CDN md5 is of the zip)
+curl -sL -o /tmp/p.zip https://cdn.jsdelivr.net/gh/lyrecoul/penmods-ota@vX.Y.Z/update_vX.Y.Z.zip
+md5sum /tmp/p.zip
+```
+
+If `@main` is stale, force a refresh with the purge API (`https://purge.jsdelivr.net/gh/lyrecoul/penmods-ota@main/updates.json`),
+then re-poll; it can take a couple of attempts.
+
+**Never force-move a tag that was already pushed** (`git tag -f` + `git push --force`). Versioned paths are cached
+forever, so the tag keeps serving the old artifact and the manifest md5 no longer matches, which makes devices fail with
+`ERROR_MD5_CHECK`. A tag's other files re-resolve correctly, but the already-fetched path stays poisoned — the fix is to
+publish under a fresh filename (e.g. `update_vX.Y.Z-r1.zip`) and point `download` at it, as done for v2.3.0.
 
 ## On-Device UI Verification
 
@@ -309,4 +543,9 @@ No test suite. Testing via QEMU emulator: build with `--qemu=y`, then `scripts/i
 - `doc/HOOK_SYSTEM_ANALYSIS.md` — internal hooks vs PluginHookAPI
 - `doc/PLUGIN_HOOK_DEV_GUIDE.md` — guide for external plugins
 - `doc/YSOUNDCENTER_ANALYSIS.md` — IDA Pro RE of `YSoundCenter`
+- `doc/DICT_FORMAT_ANALYSIS.md` — offline dictionary (`localdict/*.dat`) container format, how the engine
+  resolves/loads dictionaries, and how far dictionary extension can go (`tools/dict-probe/` holds the
+  reader/writer probe and the vendor-reader validation harnesses)
+- `doc/CUSTOM_DICT_GUIDE.md` — step-by-step guide for authors: write entries (JSONL/TSV) → build a `.dat`
+  → validate → install into `/userdisk/PenMods/dicts/` → what shows up in the result page
 - `binary/YoudaoDictPen.i64` — IDA Pro database for the target binary

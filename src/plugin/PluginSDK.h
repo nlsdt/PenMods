@@ -102,6 +102,17 @@ typedef struct PluginMediaCallbacks {
     void (*onStop)(void* user);
     void (*onSeek)(void* user, int64_t positionMs);
     void (*onOpen)(void* user);
+    /**
+     * @brief 会话被其它插件接管（可选，可留 NULL）
+     *
+     * 别的插件调用 beginSession() 抢走会话时，宿主回调这里通知你。
+     * 收到后应停止自己的播放：此时你的 handle 已经失效，后续
+     * setTrack/setPlayState/endSession 都不会生效，也不需要再调 endSession()。
+     *
+     * 该字段是按 structSize 兼容追加的，旧宿主不认识它（不会被调用），
+     * 留 NULL 也不影响其它回调。
+     */
+    void (*onSessionRevoked)(void* user);
 } PluginMediaCallbacks;
 
 /**
@@ -137,14 +148,17 @@ typedef struct PluginMediaAPI {
     /**
      * @brief 声明媒体会话
      * @param pluginId 插件唯一标识（与 metadata.json 的 id 一致），不能为 NULL
-     * @return 会话 handle，失败返回 NULL
+     * @return 会话 handle（不透明令牌），失败返回 NULL
      *
-     * 同一时刻只允许一个插件持有会话；后调用者会接管，旧持有者收到 onStop 回调。
+     * 同一时刻只允许一个插件持有会话；后调用者会接管，旧持有者收到 onSessionRevoked 回调。
+     * 被接管后旧 handle 立即失效，后续用它的调用一律被丢弃（可重新 beginSession 拿新 handle）。
      */
     void* (*beginSession)(const char* pluginId);
 
     /**
      * @brief 释放媒体会话，面板回落到宿主播放器
+     *
+     * 只有当前属主的 handle 有效，陈旧 handle 调用是 no-op。
      */
     void (*endSession)(void* handle);
 
