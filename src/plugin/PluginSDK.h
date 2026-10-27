@@ -142,8 +142,8 @@ typedef struct PluginMediaCallbacks {
  *   }
  */
 typedef struct PluginMediaAPI {
-    uint32_t structSize; //!< 由宿主填充，插件只读
-    uint32_t abiVersion; //!< 由宿主填充，插件只读；当前为 PLUGIN_MEDIA_ABI_VERSION
+    uint32_t structSize;   //!< 由宿主填充，插件只读
+    uint32_t abiVersion;   //!< 由宿主填充，插件只读；当前为 PLUGIN_MEDIA_ABI_VERSION
 
     /**
      * @brief 声明媒体会话
@@ -248,5 +248,5 @@ extern PluginMediaAPI* g_media_api;
  *
  *   PLUGIN_HOOK(addr, detour, original);
  */
-#define PLUGIN_HOOK(target, detour, original)                                                                          \
+#define PLUGIN_HOOK(target, detour, original) \
     (g_hook_api ? g_hook_api->hookFunction(target, (void*)(detour), (void**)&(original)) : -1)

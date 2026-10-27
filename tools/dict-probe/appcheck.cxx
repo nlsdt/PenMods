@@ -25,12 +25,12 @@
  *  - libDictManager leaves TranslatorParas/Init/updatePatch/Destroy undefined and
  *    resolves them from the NMT library, so preload it here as well.
  */
+#include <dlfcn.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <string>
-#include <unistd.h>
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QFile>
@@ -38,11 +38,11 @@
 
 namespace {
 
-constexpr size_t kQueryDictManagerOffset = 0x10; // counted-ptr control block header
+constexpr size_t kQueryDictManagerOffset = 0x10;  // counted-ptr control block header
 
-const char* kSymCtor    = "_ZN17YQueryDictManagerC1Ev";
-const char* kSymOpen    = "_ZN17YQueryDictManager4openERK7QString";
-const char* kSymLookUp  = "_ZN17YQueryDictManager6lookUpERK7QString";
+const char* kSymCtor = "_ZN17YQueryDictManagerC1Ev";
+const char* kSymOpen = "_ZN17YQueryDictManager4openERK7QString";
+const char* kSymLookUp = "_ZN17YQueryDictManager6lookUpERK7QString";
 const char* kSymHasWord = "_ZN17YQueryDictManager7hasWordERK7QString";
 
 std::string utf8(const QString& s) {
@@ -50,7 +50,7 @@ std::string utf8(const QString& s) {
     return std::string(b.constData(), (size_t)b.size());
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -72,61 +72,46 @@ int main(int argc, char** argv) {
     typedef void* (*CtorFn)(void*);
     typedef bool (*OpenFn)(void*, const QString&);
     typedef QString (*LookUpFn)(void*, const QString&);
-    typedef QString (*LookUpOptionsFn)(void*, const QString&, const bool&);
     typedef bool (*HasWordFn)(void*, const QString&);
 
-    CtorFn          ctor          = (CtorFn)dlsym(lib, kSymCtor);
-    OpenFn          open          = (OpenFn)dlsym(lib, kSymOpen);
-    LookUpFn        lookUp        = (LookUpFn)dlsym(lib, kSymLookUp);
-    LookUpOptionsFn lookUpOptions = (LookUpOptionsFn)dlsym(lib, "_ZN17YQueryDictManager6lookUpERK7QStringRKb");
-    HasWordFn       hasWord       = (HasWordFn)dlsym(lib, kSymHasWord);
-    if (!ctor || !open || (!lookUp && !lookUpOptions)) {
+    CtorFn ctor = (CtorFn)dlsym(lib, kSymCtor);
+    OpenFn open = (OpenFn)dlsym(lib, kSymOpen);
+    LookUpFn lookUp = (LookUpFn)dlsym(lib, kSymLookUp);
+    HasWordFn hasWord = (HasWordFn)dlsym(lib, kSymHasWord);
+    if (!ctor || !open || !lookUp) {
         fprintf(stderr, "dlsym failed: %s\n", dlerror());
         return 4;
     }
 
     static unsigned char block[0x20];
     memset(block, 0, sizeof(block));
-    *(int*)(block + 8)  = 1; // use_count
-    *(int*)(block + 12) = 1; // weak_count
-    void* manager       = block + kQueryDictManagerOffset;
+    *(int*)(block + 8) = 1;   // use_count
+    *(int*)(block + 12) = 1;  // weak_count
+    void* manager = block + kQueryDictManagerOffset;
     ctor(manager);
 
-    const QString path   = QString::fromUtf8(argv[1]);
-    QString       v2path = path;
+    const QString path = QString::fromUtf8(argv[1]);
+    QString v2path = path;
     v2path.insert(v2path.size() - 4, QStringLiteral("V2"));
-    fprintf(
-        stderr,
-        "looking for %s (exists=%d), fallback exists=%d\n",
-        v2path.toUtf8().constData(),
-        (int)QFile::exists(v2path),
-        (int)QFile::exists(path)
-    );
+    fprintf(stderr, "looking for %s (exists=%d), fallback exists=%d\n", v2path.toUtf8().constData(),
+            (int)QFile::exists(v2path), (int)QFile::exists(path));
 
     const bool opened = open(manager, path);
     printf("YQueryDictManager::open(%s) -> %d\n", argv[1], (int)opened);
 
     int failures = 0;
     for (int i = 2; i < argc; ++i) {
-        const QString word   = QString::fromUtf8(argv[i]);
-        const bool    found  = hasWord ? hasWord(manager, word) : false;
-        const bool    option = false;
-        std::string   json   = utf8(lookUpOptions ? lookUpOptions(manager, word, option) : lookUp(manager, word));
-        const auto    tab    = json.find('\t');
-        if (tab != std::string::npos) json = json.substr(tab + 1);
+        const QString word = QString::fromUtf8(argv[i]);
+        const bool found = hasWord ? hasWord(manager, word) : false;
+        const std::string json = utf8(lookUp(manager, word));
         bool plausible = !json.empty();
         if (plausible) {
-            const auto first = json.find_first_not_of(" \t\r\n");
-            plausible        = first != std::string::npos && (json[first] == '{' || json[first] == '[');
+            const char c = json[json.find_first_not_of('\t')];
+            plausible = (c == '{' || c == '[');
         }
-        printf(
-            "  hasWord=%-3s lookUp=%6zu chars %s : %.200s%s\n",
-            found ? "yes" : "no",
-            json.size(),
-            json.empty() ? "" : (plausible ? "" : "(NOT JSON!)"),
-            json.c_str(),
-            json.size() > 200 ? " ..." : ""
-        );
+        printf("  hasWord=%-3s lookUp=%6zu chars %s : %.200s%s\n", found ? "yes" : "no", json.size(),
+               json.empty() ? "" : (plausible ? "" : "(NOT JSON!)"), json.c_str(),
+               json.size() > 200 ? " ..." : "");
         if (!json.empty() && !plausible) failures++;
     }
     fflush(stdout);

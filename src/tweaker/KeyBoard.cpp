@@ -8,6 +8,7 @@
 
 #include "common/Event.h"
 #include "mod/Config.h"
+#include "system/input/ScreenManager.h"
 
 #include "base/YPointer.h"
 
@@ -30,16 +31,17 @@ KeyBoard::KeyBoard() {
 }
 
 void KeyBoard::setKeyboardLayout(const QString& value) {
-    const QString layout = value == "compact" ? "compact" : "native";
-    if (m_keyboardLayout == layout) return;
-    m_keyboardLayout = layout;
-    mCfg["layout"]   = layout.toStdString();
+    const QString normalized = value == "compact" ? "compact" : "native";
+    if (m_keyboardLayout == normalized) return;
+    m_keyboardLayout = normalized;
+    mCfg["layout"]   = normalized.toStdString();
     WRITE_CFG;
     emit keyboardLayoutChanged();
 }
 
 void KeyBoard::setAutoSendScan(bool value) {
-    if (value && m_inputPageShowing) return;
+    if (value && m_inputPageShowing)
+        return;
     if (m_autoSendScan != value) {
         m_autoSendScan = value;
         emit autoSendScanChanged();
@@ -56,8 +58,8 @@ void KeyBoard::setInputPageShowing(bool value) {
 void KeyBoard::setAutoSendScanConfig(bool value) {
     if (m_autoSendScanConfig != value) {
         m_autoSendScanConfig = value;
-        auto& config         = mod::Config::getInstance();
-        json  aiCfg          = config.read("ai");
+        auto& config = mod::Config::getInstance();
+        json aiCfg   = config.read("ai");
         if (aiCfg.is_null()) aiCfg = json::object();
         aiCfg["auto_send_scan"] = value;
         config.write("ai", aiCfg, true);
@@ -65,7 +67,6 @@ void KeyBoard::setAutoSendScanConfig(bool value) {
     }
 }
 
-#if PL_BUILD_YDP02X
 bool KeyBoard::startVoiceInput(QObject* speechManager) {
     auto* startAsrRecord = PEN_SYM("_ZN14YSpeechManager14startAsrRecordEv");
     auto* setAsrResult   = PEN_SYM("_ZN14YSpeechManager12setAsrResultERK7QString");
@@ -87,38 +88,19 @@ bool KeyBoard::stopVoiceInput(QObject* speechManager) {
     reinterpret_cast<void (*)(void*)>(stopAsrRecord)(speechManager);
     return true;
 }
-#else
-// YDP03X: voice input is not wired to the YDP02X speech manager symbols.
-bool KeyBoard::startVoiceInput(QObject*) { return false; }
-bool KeyBoard::stopVoiceInput(QObject*) { return false; }
-#endif
 
 } // namespace mod
 
-#if PL_BUILD_YDP02X
 PEN_HOOK(uint64, _ZN7YGlobal14showSpeechPageEv, uint64 self) {
     if (mod::KeyBoard::getInstance().isStartingVoiceInput()) return 0;
     return origin(self);
 }
-#endif
 
 static bool shouldBlockScan() {
-#if PL_BUILD_YDP02X
-    auto*      global             = mod::YPointer<YGlobal>::getInstance();
-    auto*      isInputPageShowing = PEN_SYM("_ZNK7YGlobal16inputPageShowingEv");
-    const bool inputPageShowing =
-        global && isInputPageShowing && reinterpret_cast<bool (*)(void*)>(isInputPageShowing)(global);
+    bool inputPageShowing = PEN_CALL(bool, "_ZNK7YGlobal16inputPageShowingEv", void*)(mod::YPointer<YGlobal>::getInstance());
     return inputPageShowing || mod::KeyBoard::getInstance().autoSendScan();
-#elif PL_BUILD_YDP03X
-    // Only custom PenMods input pages should consume scan events. The QWE widget state
-    // is owned by the original application and can remain active during normal scans.
-    return mod::KeyBoard::getInstance().inputPageShowing();
-#else
-    return mod::KeyBoard::getInstance().inputPageShowing();
-#endif
 }
 
-#if PL_BUILD_YDP02X
 PEN_HOOK(bool, _ZN11YSystemBase12onScanFinishERK7QStringi, uint64 self, QString const& content, ScanType scanType) {
     if (shouldBlockScan()) {
         emit mod::KeyBoard::getInstance().scanFinished(content);
@@ -126,18 +108,9 @@ PEN_HOOK(bool, _ZN11YSystemBase12onScanFinishERK7QStringi, uint64 self, QString 
     }
     return origin(self, content, scanType);
 }
-#else
-PEN_HOOK(bool, _ZN11YSystemBase12onScanFinishERK7QStringi, uint64 self, const QString& content, int scanType) {
-    if (shouldBlockScan()) {
-        emit mod::KeyBoard::getInstance().scanFinished(content);
-        return false;
-    }
-    return origin(self, content, scanType);
-}
-#endif
 
-#if PL_BUILD_YDP02X
 PEN_HOOK(uint64, _ZN11YSystemBase8ocrStartEv, uint64 self, uint64 a2, uint64 a3, uint64 a4, uint64 a5) {
+    mod::ScreenManager::getInstance().setSystemBase(reinterpret_cast<YSystemBase*>(self));
     const bool isButtonRelease =
         PEN_CALL(bool, "_ZNK11YSystemBase15isButtonReleaseEv", void*)(reinterpret_cast<void*>(self));
     if (!isButtonRelease) {
@@ -148,37 +121,16 @@ PEN_HOOK(uint64, _ZN11YSystemBase8ocrStartEv, uint64 self, uint64 a2, uint64 a3,
     }
     return origin(self, a2, a3, a4, a5);
 }
-#else
-PEN_HOOK(uint64, _ZN11YSystemBase8ocrStartEv, uint64 self) {
-    const bool isButtonRelease =
-        PEN_CALL(bool, "_ZNK11YSystemBase15isButtonReleaseEv", void*)(reinterpret_cast<void*>(self));
-    if (!isButtonRelease) {
-        emit mod::Event::getInstance().ocrStarted();
-    }
-    if (shouldBlockScan()) {
-        return false;
-    }
-    return origin(self);
-}
-#endif
 
-#if PL_BUILD_YDP02X
 PEN_HOOK(uint64, _ZN11YSystemBase7ocrStopEi, uint64 self, int a2, uint64 a3, uint64 a4, uint64 a5) {
+    // 先发事件再判拦截：被 shouldBlockScan 拦下的扫描也必须关窗，否则扫描保护会一直占着 MUSIC 引用。
+    emit mod::Event::getInstance().ocrStopped();
     if (shouldBlockScan()) {
         return false;
     }
     return origin(self, a2, a3, a4, a5);
 }
-#else
-PEN_HOOK(uint64, _ZN11YSystemBase7ocrStopEi, uint64 self, int scanType) {
-    if (shouldBlockScan()) {
-        return false;
-    }
-    return origin(self, scanType);
-}
-#endif
 
-#if PL_BUILD_YDP02X
 PEN_HOOK(
     uint64,
     _ZN11YSystemBase25ocrCompletedResultChangedEv,
@@ -191,13 +143,6 @@ PEN_HOOK(
     if (shouldBlockScan()) {
         return false;
     }
-    return origin(self, a5, a2, a3, a4);
+    // origin 的实参按 ABI 顺序 a2,a3,a4,a5 传，调换会让宿主读到别的字段。
+    return origin(self, a2, a3, a4, a5);
 }
-#else
-PEN_HOOK(uint64, _ZN11YSystemBase25ocrCompletedResultChangedEv, uint64 self) {
-    if (shouldBlockScan()) {
-        return false;
-    }
-    return origin(self);
-}
-#endif

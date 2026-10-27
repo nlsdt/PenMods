@@ -154,6 +154,13 @@ PEN_HOOK(void, _ZN22YGuiApplicationPrivate6initUiEv,
 
     mod::YPointer<QQuickView>::setInstance(&view);
 
+    // 外部 QML 模块（如内嵌 FFmpeg 播放器插件）的部署目录，缺失时静默跳过
+    const char* ExternalQmlDir = "/userdata/PenMods/qml";
+    if (QFile::exists(ExternalQmlDir)) {
+        view.engine()->addImportPath(ExternalQmlDir);
+        spdlog::info("Added external QML import path: {}", ExternalQmlDir);
+    }
+
     emit mod::Event::getInstance().beforeUiInitialization(view, context);
 
     bool                 using_external_resources = false;
@@ -172,14 +179,17 @@ PEN_HOOK(void, _ZN22YGuiApplicationPrivate6initUiEv,
             auto get_data   = (get_res_t)dlsym(lib, "get_qt_resource_data");
             auto get_name   = (get_res_t)dlsym(lib, "get_qt_resource_name");
 
-            Q_ASSERT(get_struct && get_data && get_name);
+            // Q_ASSERT 在 release 构建里会被编译掉，这里显式校验并回落到内置资源
+            if (!get_struct || !get_data || !get_name) {
+                spdlog::error("libPenModsResources.so is missing resource symbols, falling back to built-in resources");
+            } else {
+                new_qt_resource_struct = get_struct();
+                new_qt_resource_data   = get_data();
+                new_qt_resource_name   = get_name();
 
-            new_qt_resource_struct = get_struct();
-            new_qt_resource_data   = get_data();
-            new_qt_resource_name   = get_name();
-
-            spdlog::info("Using external Qt res.");
-            using_external_resources = true;
+                spdlog::info("Using external Qt res.");
+                using_external_resources = true;
+            }
         }
     }
 

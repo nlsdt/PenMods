@@ -1,12 +1,14 @@
 -- ============================================================================
 -- Haikure/ffmpeg-player —— Qt5 QML 视频播放器插件（已 vendor 进 PenMods）
---   上游   : https://github.com/Haikure/ffmpeg-player  (v1.0.0 / 48ca849, GPL-3.0)
+--   上游   : https://github.com/Haikure/ffmpeg-player  (v1.0.3 / d7733e3, GPL-3.0)
 --   改动   : external/ffmpeg-player/UPSTREAM.md
---   接入说明: doc/FFMPEG_PLAYER.md
+--   分析与实测: doc/FFMPEG_PLAYER_ANALYSIS.md
 --   构建   : xmake build ffmpegplayerplugin
 --            （产物 build/<plat>/<arch>/<mode>/qml/FFmpegPlayer/）
 --   部署   : scripts/deploy_ffmpeg_player.sh
---   YDP03X 已启用 VPU，沿用插件默认的 MPP 硬解选择，无需修改设备配置。
+--   注意   : 硬解版本要求内核已启用 VPU（/dev/vpu_service）；出厂固件没有，
+--            宿主侧有一条门控（src/mod/Mod.cpp）会在这时强制软解，
+--            否则 librockchip_mpp 会在 mpp_init 里段错误并带走宿主进程。
 -- ============================================================================
 
 -- 本子工程默认**不参与**工程解析：它带来一整套从源码编译的依赖
@@ -18,7 +20,7 @@
 --   PENMODS_WITH_PLAYER=1 xmake f -c <原有配置...> && xmake build ffmpegplayerplugin
 --
 -- 需要时显式开启（内置播放器与 scripts/deploy_ffmpeg_player.sh 都要用到）。
-if os.getenv("PENMODS_WITH_PLAYER") ~= "1" then
+if not os.getenv("PENMODS_WITH_PLAYER") then
     -- 工程文件一次调用里会被求值多次，提示只打一次（xmake 的沙箱里没有 _G，直接写全局）
     if not __penmods_ffplayer_hint then
         __penmods_ffplayer_hint = true
@@ -30,14 +32,13 @@ end
 set_license("GPL-3.0")
 
 local FFPLAYER_DIR = path.join(os.projectdir(), "external", "ffmpeg-player")
-local DEVICE_LIB_DIR = path.join(FFPLAYER_DIR, "external", "dictpen")
 
 -- 设备侧 MPP/DRM 动态库（链接用）是否齐全：缺了就只编纯软解版本。
 -- 想强制软解（即使库齐全）：PENMODS_FFMPEG_PLAYER_SW=1 xmake f -c ... && xmake build ffmpegplayerplugin
 -- 这里不用 xmake option：本机 xmake 在工程加载阶段 get_config() 读不到 CLI 传进来的值。
 local function has_device_libs(...)
     for _, name in ipairs({...}) do
-        if not os.isfile(path.join(DEVICE_LIB_DIR, name)) then
+        if not os.isfile(path.join(FFPLAYER_DIR, "external", "dictpen", name)) then
             return false
         end
     end
@@ -95,6 +96,9 @@ package_end()
 add_requires("libass 0.17.4", {configs = {shared = false, pic = true,
     cxflags = {"-Os", "-fno-sanitize=all", "-ffunction-sections", "-fdata-sections"}}})
 
+-- 上游 v1.0.1 起自带一份 OpenSSL 3 的安装配方（基于 xmake-repo 的 openssl3）。
+-- 目的：把 OpenSSL 的交叉编译参数（buildenvs 的 CFLAGS/ASFLAGS）显式传给 make，
+-- 不随 xmake-repo 的 openssl3 配方漂移而变；PenMods 侧只把版本钉在本地仓库有的 3.5.6。
 package("ffplayer-openssl3")
     set_base("openssl3")
     on_install("linux", function (package)
@@ -104,7 +108,6 @@ package("ffplayer-openssl3")
         local arches = {arm64 = "aarch64", ["arm64-v8a"] = "aarch64", aarch64 = "aarch64",
             x86_64 = "x86_64", x86 = "x86", i386 = "x86"}
         local arch = assert(arches[package:arch()], "Unsupported OpenSSL architecture: " .. package:arch())
-        -- Keep OpenSSL's test programs and test suite out of the device build.
         local configs = {"linux-" .. arch, "no-tests", "--libdir=lib",
             "--openssldir=" .. package:installdir(), "--prefix=" .. package:installdir(),
             package:config("shared") and "shared" or "no-shared",
@@ -120,6 +123,8 @@ package("ffmpeg")
     set_homepage("https://www.ffmpeg.org")
     set_description("FFmpeg 3.4.8")
     set_license("GPL-3.0")
+    -- 依赖名称或配置变化后不能复用旧安装记录，否则会遗漏 OpenSSL 等静态链接依赖。
+    set_policy("package.librarydeps.strict_compatibility", true)
 
     add_urls("https://ffmpeg.org/releases/ffmpeg-$(version).tar.bz2", {alias = "home"})
 
@@ -147,7 +152,7 @@ package("ffmpeg")
     on_install("linux", "macosx", "android", "iphoneos", function (package)
         import("package.tools.autoconf")
         local envs = autoconf.buildenvs(package)
-
+        
         -- 按文件名顺序应用所有补丁（0001 binutils 兼容，0002 rkmppdec 适配新版 MPP）
         local patches = os.files(path.join(FFPLAYER_DIR, "patches", "*.patch"))
         table.sort(patches)
@@ -269,7 +274,6 @@ package("ffmpeg")
             table.insert(configs, "--enable-libdrm")
             table.insert(configs, "--enable-rkmpp")
             table.insert(dependency_pcdirs, rkmpp_pcdir)
-            ldflags = ldflags .. " -L" .. DEVICE_LIB_DIR
         end
         envs.PKG_CONFIG_LIBDIR = table.concat(dependency_pcdirs, ":")
         envs.PKG_CONFIG_PATH = envs.PKG_CONFIG_LIBDIR
@@ -295,9 +299,8 @@ add_requires("ffmpeg        3.4.8", {
         -- 该字段参与包哈希：改动它即可强制重编 ffmpeg 包。
         -- 不要把 has_device_libs() 的返回值直接喂给 rkmpp：本机出现过同一份工程
         -- 解析出 rkmpp=false 的旧变体并被链接、导致产物没有硬解的情况，
-        -- Revision 9 also invalidates caches that depended on the old openssl3
-        -- name instead of the optimized ffplayer-openssl3 recipe above.
-        network_revision = 9,
+        -- 见 doc/FFMPEG_PLAYER_ANALYSIS.md §8.5。
+        network_revision = 8,
         rkmpp = use_rkmpp,
     }
 })
@@ -321,7 +324,7 @@ target("ffmpegplayerplugin")
         'QtQml',
         'QtGui')
     add_includedirs(path.join(FFPLAYER_DIR, "external", "alsa-lib-1.1.5", "include"))
-    add_linkdirs(DEVICE_LIB_DIR)
+    add_linkdirs(path.join(FFPLAYER_DIR, "external", "dictpen"))
     add_links("asound")
     if use_rkmpp and is_plat("linux") and is_arch("arm64", "arm64-v8a", "aarch64") then
         add_links("rockchip_mpp", "drm")
@@ -332,7 +335,6 @@ target("ffmpegplayerplugin")
     add_cxflags("-ffunction-sections", "-fdata-sections", {force = true})
     if is_mode("release") then add_shflags("-s", {force = true}) end
     on_load(function (target)
-        assert(has_device_libs("libasound.so"), "Missing bundled ALSA library: " .. path.join(DEVICE_LIB_DIR, "libasound.so"))
         target:data_set("linkdepfiles", {path.join(FFPLAYER_DIR, "src", "ffmpegplayer.exports")})
         -- qt.moc 生成的 moc 单元在重建时可能拿不到 add_packages 的 include 目录，
         -- 显式补一遍（否则 moc_FFmpegVideoPlayerQml.cpp 找不到 libavcodec/avcodec.h）
@@ -352,9 +354,11 @@ target("ffmpegplayerplugin")
                 local generated = target:autogenfile(path.join("external", "ffmpeg-player", "src", "moc_" .. name .. ".cpp"))
                 os.tryrm(target:objectfile(generated))
             end
-        end, {files = os.files(path.join(FFPLAYER_DIR, "src", "*.hpp")),
+        end, {files = os.files(path.join(os.projectdir(), "external", "ffmpeg-player", "src", "*.hpp")),
               dependfile = target:dependfile("ffplayer-moc-headers")})
     end)
+    -- libavcodec 依赖设备上的 librockchip_mpp/libdrm，链接时从这里解析
+    add_ldflags("-Wl,-rpath-link," .. path.join(FFPLAYER_DIR, "external", "dictpen"), {force = true})
     after_build(function (target)
         local module_dir = path.join(target:targetdir(), "qml", "FFmpegPlayer")
         os.mkdir(module_dir)

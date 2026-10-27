@@ -1,119 +1,41 @@
-#!/usr/bin/env bash
-# Deploy the YDP03X host, resource overlay and optional QML plugin together.
-set -euo pipefail
+#!/bin/bash
+# 部署内嵌 FFmpeg 播放器插件（QML 模块）到设备。
+#
+#   scripts/deploy_ffmpeg_player.sh [mode]
+#
+# 产物来自 `xmake build ffmpegplayerplugin`：
+#   build/linux/arm64-v8a/<mode>/qml/FFmpegPlayer/{libffmpegplayerplugin.so,qmldir}
+#
+# 注意：`.so` 先推到临时文件名再 mv，避免覆盖正在被宿主进程 mmap 的旧文件
+# （直接覆盖会让运行中的进程执行到不一致的代码而崩溃，见 AGENTS.md）。
 
-repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-mode=release
-plugin_only=false
-dry_run=false
-adb_command=("${ADB:-adb}")
+set -e
 
-usage() {
-    echo "Usage: $0 [--mode release|debug] [--serial SERIAL] [--plugin-only] [--dry-run]"
-    echo "Default: deploy libPenMods.so, libPenModsResources.so and FFmpegPlayer to /userdisk/PenMods."
-}
+MODE=${1:-release}
+ARCH=arm64-v8a
+PLAT=linux
+SRC_DIR="build/$PLAT/$ARCH/$MODE/qml/FFmpegPlayer"
+DST_DIR=/userdata/PenMods/qml/FFmpegPlayer
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --mode)
-            [[ $# -ge 2 ]] || { usage >&2; exit 1; }
-            mode=$2
-            shift 2
-            ;;
-        --serial)
-            [[ $# -ge 2 ]] || { usage >&2; exit 1; }
-            adb_command+=(-s "$2")
-            shift 2
-            ;;
-        --plugin-only) plugin_only=true; shift ;;
-        --dry-run) dry_run=true; shift ;;
-        --help|-h) usage; exit 0 ;;
-        *) usage >&2; exit 1 ;;
-    esac
-done
-[[ "$mode" == release || "$mode" == debug ]] || { usage >&2; exit 1; }
-
-artifact_dir="$repo_dir/build/linux/arm64-v8a/$mode"
-module_dir="$artifact_dir/qml/FFmpegPlayer"
-destination=/userdisk/PenMods
-sources=()
-destinations=()
-if [[ "$plugin_only" == false ]]; then
-    sources+=("$artifact_dir/libPenMods.so" "$artifact_dir/libPenModsResources.so")
-    destinations+=("$destination/libPenMods.so" "$destination/libPenModsResources.so")
-fi
-sources+=("$module_dir/libffmpegplayerplugin.so" "$module_dir/qmldir")
-destinations+=("$destination/qml/FFmpegPlayer/libffmpegplayerplugin.so" "$destination/qml/FFmpegPlayer/qmldir")
-
-hashes=()
-for index in "${!sources[@]}"; do
-    file=${sources[$index]}
-    [[ -s "$file" ]] || { echo "Missing artifact: $file" >&2; exit 1; }
-    read -r digest _ < <(sha256sum "$file")
-    hashes+=("$digest")
-    printf '%s -> %s\n  SHA256 %s\n' "$file" "${destinations[$index]}" "$digest"
-done
-
-if [[ "$dry_run" == true ]]; then
-    echo "Dry run: artifacts checked; no device commands executed."
-    exit 0
+if [ ! -f "$SRC_DIR/libffmpegplayerplugin.so" ]; then
+    echo "找不到产物: $SRC_DIR/libffmpegplayerplugin.so"
+    echo "先构建（插件的依赖链默认不参与工程解析，见 external/ffmpeg-player/UPSTREAM.md）："
+    echo "  PENMODS_WITH_PLAYER=1 xmake f -c <原有配置...> && xmake build ffmpegplayerplugin"
+    exit 1
 fi
 
-state=$("${adb_command[@]}" get-state)
-[[ "$state" == device ]] || { echo "No ready ADB device; use --serial if needed." >&2; exit 1; }
-"${adb_command[@]}" shell "mkdir -p '$destination/qml/FFmpegPlayer'"
+echo "==> 部署 $SRC_DIR/ 到 $DST_DIR/"
+adb shell "mkdir -p $DST_DIR"
 
-staging_suffix=".penmods-new-$$"
-staged=()
-cleanup() {
-    # Only remove this invocation's temporary uploads, never deployed libraries.
-    for temporary in "${staged[@]}"; do
-        "${adb_command[@]}" shell "rm -f '$temporary'" >/dev/null 2>&1 || true
-    done
-}
-trap cleanup EXIT
+# qmldir 只是文本，直接覆盖
+adb push "$SRC_DIR/qmldir" "$DST_DIR/qmldir"
 
-# Upload and verify every file before replacing anything. Rename instead of
-# truncating .so files that are still mapped by the running host process.
-for index in "${!sources[@]}"; do
-    temporary="${destinations[$index]}$staging_suffix"
-    staged+=("$temporary")
-    "${adb_command[@]}" push "${sources[$index]}" "$temporary"
-    remote=$("${adb_command[@]}" shell "sha256sum '$temporary'")
-    remote=${remote%% *}
-    [[ "$remote" == "${hashes[$index]}" ]] || { echo "Upload hash mismatch: $temporary" >&2; exit 1; }
-done
+# 插件本体：tmp + rename
+adb push "$SRC_DIR/libffmpegplayerplugin.so" "$DST_DIR/libffmpegplayerplugin.tmp.so"
+adb shell "mv -f $DST_DIR/libffmpegplayerplugin.tmp.so $DST_DIR/libffmpegplayerplugin.so; sync"
 
-publish_command="set -e; "
-for index in "${!destinations[@]}"; do
-    publish_command+="mv -f '${staged[$index]}' '${destinations[$index]}'; "
-done
-publish_command+="sync"
-"${adb_command[@]}" shell "$publish_command"
-staged=()
-
-for index in "${!destinations[@]}"; do
-    remote=$("${adb_command[@]}" shell "sha256sum '${destinations[$index]}'")
-    remote=${remote%% *}
-    [[ "$remote" == "${hashes[$index]}" ]] || { echo "Deployed hash mismatch: ${destinations[$index]}" >&2; exit 1; }
-done
-
-"${adb_command[@]}" shell 'if pidof YoudaoDictPen >/dev/null; then killall YoudaoDictPen; fi'
-for attempt in {1..12}; do
-    sleep 1
-    pid=$("${adb_command[@]}" shell pidof YoudaoDictPen 2>/dev/null || true)
-    pid=${pid//$'\r'/}
-    if [[ -n "$pid" ]]; then
-        # Wait once more to catch an immediate startup crash.
-        sleep 2
-        running=$("${adb_command[@]}" shell pidof YoudaoDictPen 2>/dev/null || true)
-        running=${running//$'\r'/}
-        if [[ "$running" == "$pid" ]]; then
-            echo "Deployed and verified. YoudaoDictPen PID: $pid"
-            echo "Open a video in the file manager to verify playback and controls."
-            exit 0
-        fi
-    fi
-done
-echo "Artifacts verified, but YoudaoDictPen did not remain running; inspect the device startup log." >&2
-exit 1
+adb shell "ls -la $DST_DIR/"
+echo
+echo "==> 重启宿主进程以加载新插件"
+adb shell 'killall YoudaoDictPen'
+echo "完成（guardian 会在几秒内重启应用）"

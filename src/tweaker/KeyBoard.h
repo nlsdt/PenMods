@@ -16,8 +16,7 @@ class KeyBoard : public QObject, public Singleton<KeyBoard> {
     Q_OBJECT
     Q_PROPERTY(bool inputPageShowing READ inputPageShowing WRITE setInputPageShowing NOTIFY inputPageShowingChanged)
     Q_PROPERTY(bool autoSendScan READ autoSendScan WRITE setAutoSendScan NOTIFY autoSendScanChanged)
-    Q_PROPERTY(bool autoSendScanConfig READ autoSendScanConfig WRITE setAutoSendScanConfig NOTIFY
-                   autoSendScanConfigChanged)
+    Q_PROPERTY(bool autoSendScanConfig READ autoSendScanConfig WRITE setAutoSendScanConfig NOTIFY autoSendScanConfigChanged)
     // 键盘按键布局: "native"(原生) / "compact"(紧凑, 字母键使用 QWERTY 排列)
     Q_PROPERTY(QString keyboardLayout READ keyboardLayout WRITE setKeyboardLayout NOTIFY keyboardLayoutChanged)
 public:
@@ -48,12 +47,12 @@ signals:
 private:
     friend Singleton<KeyBoard>;
     explicit KeyBoard();
-    bool        m_inputPageShowing   = false;
-    bool        m_autoSendScan       = false;
-    bool        m_autoSendScanConfig = true;
-    bool        m_startingVoiceInput = false;
-    QString     m_keyboardLayout     = "native";
-    std::string mClassName           = "keyboard";
+    bool    m_inputPageShowing   = false;
+    bool    m_autoSendScan       = false;
+    bool    m_autoSendScanConfig = true;
+    bool    m_startingVoiceInput = false;
+    QString     m_keyboardLayout = "native";
+    std::string mClassName       = "keyboard";
     json        mCfg;
 };
 

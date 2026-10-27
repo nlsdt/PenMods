@@ -1,19 +1,12 @@
 # OCR 引擎替换分析(实验性 PP-OCRv5 backend)
 
-本文件保留二代的实验与逆向记录。三代继续使用原厂 OCR，本分支不接入替换后端或设置开关。
-
-2026-10-09 补充：检查 `/home/haiku/build/pen/output/aarch64_libs/libyocr.so`，三代除下文的六个
-接口外，还导出 `yocr_recognize_flow`、公式识别启停、手写识别启停和 `yocr_set_question_type`。
-因此二代的六接口替换库不能直接视为三代兼容实现。本次仅记录符号差异，未替换或部署三代 OCR。
-
 > 目标: 逆向有道词典笔的 OCR 链路,把"认字"这一步换成飞桨 PP-OCRv5 模型,并评估可行性
 >
 > 分析日期: 2026-10-04
 >
 > 目标文件: `binary/YoudaoDictPen` + `/oem/YoudaoDictPen/output/aarch64_libs/libyocr.so`
 >
-> 二代研究代码: [main 分支的 tools/ppocr-backend](https://github.com/Haikure/PenMods/tree/main/tools/ppocr-backend)，
-> 本机位于 `/home/haiku/program/PenMods/tools/ppocr-backend/`，配合 `doc/CAMERA_CAPTURE_ANALYSIS.md`。
+> 代码: `tools/ppocr-backend/`(shim + 构建/部署脚本),配合 `doc/CAMERA_CAPTURE_ANALYSIS.md`
 
 ---
 
