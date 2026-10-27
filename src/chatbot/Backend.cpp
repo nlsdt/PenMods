@@ -32,6 +32,8 @@
 #include <QRegularExpression>
 #include <QRunnable>
 #include <QSaveFile>
+#include <QTextCharFormat>
+#include <QTextCursor>
 #include <QTextDocument>
 #include <QTextStream>
 #include <QTimer>

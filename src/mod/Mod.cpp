@@ -326,8 +326,6 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(TouchCalibration);
     INSTANCE(VpuUnlock);
     INSTANCE(WordBookTweaks);
-    INSTANCE(TouchCalibration);
-    INSTANCE(CustomDict);
 
     // hitokoto
     INSTANCE(hitokoto::Hitokoto)
@@ -337,9 +335,6 @@ __attribute__((constructor)) static void BeforeMain() {
 
     // rime
     INSTANCE(rime::Backend)
-
-    // plugin
-    INSTANCE(MediaSession)
 
     // wallpaper
     INSTANCE(WallpaperManager)

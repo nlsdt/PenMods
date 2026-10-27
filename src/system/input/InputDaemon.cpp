@@ -62,14 +62,6 @@ void InputDaemon::setSystemSuspendOverride(bool enabled) {
     _resetConfig();
 }
 
-void InputDaemon::setSystemSuspendOverride(bool enabled) {
-    if (mSystemSuspendOverride == enabled) {
-        return;
-    }
-    mSystemSuspendOverride = enabled;
-    _resetConfig();
-}
-
 void InputDaemon::reset() {
     mScreenOff     = ScreenManager::getInstance().getAutoSleepDuration();
     mBackLightDown = mScreenOff > 10 ? mScreenOff - 10 : 0;
