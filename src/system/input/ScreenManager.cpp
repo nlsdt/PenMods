@@ -8,8 +8,6 @@
 #include "system/input/InputDaemon.h"
 #include "system/sound/AudioDaemon.h"
 
-#include "filemanager/player/MusicPlayer.h"
-
 #include "base/YEnum.h"
 
 #include "common/Event.h"
@@ -21,7 +19,7 @@
 
 namespace mod {
 
-ScreenManager::ScreenManager() {
+ScreenManager::ScreenManager() : Logger("ScreenManager") {
 
     mCfg = Config::getInstance().read(mClassName);
 
@@ -149,12 +147,20 @@ bool ScreenManager::eventFilter(QObject* watched, QEvent* event) {
 }
 
 void ScreenManager::onScreenOn() {
-    qInfo() << "screen on: reset inactivity shutdown timer";
+    info("screen on: reset inactivity shutdown timer");
+    mScreenOn = true;
+    if (mResumePending) {
+        // 补做 rtSetAutoScreenOff 延迟的那次 resume（灭屏时调厂商接口会立刻把屏幕点亮）。
+        mResumePending = false;
+        info("屏幕已亮，补做延迟的 start_auto_screen_off");
+        InputDaemon::getInstance().resume();
+    }
     resetInactivityTimer();
 }
 
 void ScreenManager::onScreenOff() {
-    qInfo() << "screen off: reset inactivity shutdown timer";
+    info("screen off: reset inactivity shutdown timer");
+    mScreenOn = false;
     resetInactivityTimer();
 }
 
@@ -164,6 +170,13 @@ void ScreenManager::resetInactivityTimer() {
 }
 
 void ScreenManager::requestPowerOff() {
+    // The audio lock keeps the whole device awake while something is playing,
+    // so a pending auto-shutdown must not cut the audio output either.
+    if (mAudioLockActive) {
+        qInfo() << "inactivity shutdown timer expired but audio lock is active; deferring";
+        resetInactivityTimer();
+        return;
+    }
     qInfo() << "inactivity shutdown timer expired";
     if (mSystemBase == nullptr) {
         qWarning() << "cannot power off: YSystemBase is not captured";
@@ -235,17 +248,41 @@ void ScreenManager::setIntelSleepAudioLock(bool val) {
 
 void ScreenManager::onAudioDaemonStateChanged() {
     bool audioActive = AudioDaemon::getInstance().state() == AudioDaemonState::PLAYING;
-    if (mIntelSleepAudioLock && audioActive && !mAudioLockActive) {
+    // The same switch guards every idle action that would cut audio output:
+    // screen off (host stop_auto_screen_off) and system suspend (the
+    // system_suspend idle action of input-event-daemon). Suspend powers down
+    // the radio, so Bluetooth playback would not resume after a wake-up.
+    bool shouldLock = mIntelSleepAudioLock && audioActive;
+    if (shouldLock && !mAudioLockActive) {
         mAudioLockActive = true;
+        // setSystemSuspendOverride() rewrites the daemon config and restarts
+        // input-event-daemon. The host pause is delivered with SIGUSR1 to the
+        // running process (plus a /tmp marker), and a freshly started daemon
+        // starts unpaused, so re-apply the screen pause after the restart.
+        InputDaemon::getInstance().setSystemSuspendOverride(true);
         rtSetAutoScreenOff(false);
-    } else if (mAudioLockActive && (!audioActive || !mIntelSleepAudioLock)) {
+    } else if (mAudioLockActive && !shouldLock) {
         mAudioLockActive = false;
         rtSetAutoScreenOff(true);
+        InputDaemon::getInstance().setSystemSuspendOverride(false);
     }
 }
 
 void ScreenManager::rtSetAutoScreenOff(bool val) {
-    val ? InputDaemon::getInstance().resume() : InputDaemon::getInstance().pause();
+    if (!val) {
+        mResumePending = false;
+        InputDaemon::getInstance().pause();
+        return;
+    }
+    if (!mScreenOn) {
+        // 屏幕灭着时调厂商的 start_auto_screen_off() 正是实测"按电源键熄屏后马上又亮"的位置，
+        // 所以先记一笔，等 onScreenOn 再补做。
+        mResumePending = true;
+        info("屏幕未亮，延迟 start_auto_screen_off");
+        return;
+    }
+    mResumePending = false;
+    InputDaemon::getInstance().resume();
 }
 
 } // namespace mod
@@ -270,11 +307,10 @@ PEN_HOOK(void, _ZN11YSystemBase11onScreenOffEv, void* self) {
 
 PEN_HOOK(uint64, _ZN7YGlobal27isInPlayerCenterPageChangedEv, uint64 self, uint64 a2, uint64 a3, uint64 a4, uint64 a5) {
     bool isInPage = PEN_CALL(bool, "_ZNK7YGlobal20isInPlayerCenterPageEv", uint64)(self);
-    mod::ScreenManager ::getInstance().onInPlayerPageChanged(isInPage);
-    // 离开播放器页面时，清理文件管理器创建的临时软链接
-    if (!isInPage) {
-        mod::filemanager::MusicPlayer::getInstance().cleanupTempSymlinks();
-    }
+    mod::ScreenManager::getInstance().onInPlayerPageChanged(isInPage);
+    // 离开播放器页面**不能**删临时软链接：宿主 YMediaPlayerManager 还拿着那条 localFile，
+    // onClickedPlay 会先查它是否存在，链接一没就直接 fileNotExist() + onResetPlayer()，
+    // 回到播放页按播放键再也不会有反应。链接由 MusicPlayer 自己管（进程内留存、启动时清）。
     mod::ScreenManager::getInstance().resetInactivityTimer();
     return origin(self, a2, a3, a4, a5);
 }
@@ -291,5 +327,6 @@ PEN_HOOK(
     mod::ScreenManager::getInstance().onPlayStateChanged(
         PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", uint64)(self)
     );
-    return origin(self, a5, a2, a3, a4);
+    // origin 的实参按 ABI 顺序 a2,a3,a4,a5 传，调换会让回读到的 playState 变成别的字段。
+    return origin(self, a2, a3, a4, a5);
 }

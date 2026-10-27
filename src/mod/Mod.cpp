@@ -15,6 +15,8 @@
 #include "common/Utils.h"
 #include "common/util/System.h"
 
+#include "helper/CaCertificates.h"
+
 #include "Version.h"
 
 #include <QCryptographicHash>
@@ -23,6 +25,8 @@
 #include <QProcessEnvironment>
 #include <QQmlContext>
 #include <QQuickView>
+
+#include <unistd.h>
 
 namespace mod {
 
@@ -175,6 +179,7 @@ PEN_HOOK(bool, license_verify) { return true; }
 
 #include "helper/AntiEmbs.h"
 #include "helper/DeveloperSettings.h"
+#include "helper/FontCache.h"
 #include "helper/NetworkSettings.h"
 #include "helper/ServiceManager.h"
 
@@ -200,6 +205,8 @@ PEN_HOOK(bool, license_verify) { return true; }
 #include "tweaker/OcrBackend.h"
 #include "tweaker/QueryTweaks.h"
 #include "tweaker/TextBookHelper.h"
+#include "tweaker/TouchCalibration.h"
+#include "tweaker/VpuUnlock.h"
 #include "tweaker/WordBookTweaks.h"
 
 #include "hitokoto/Backend.h"
@@ -224,6 +231,14 @@ __attribute__((constructor)) static void BeforeMain() {
 #endif
     spdlog::set_pattern("[%H:%M:%S.%e] [%n] [%l] %v");
     spdlog::set_default_logger(global);
+
+    // 设备树 vpu_combo 被禁用（出厂固件）时，厂商 MPP 会在 mpp_init() 里段错误，
+    // 内嵌播放器必须先被禁止尝试硬解，否则崩溃会带走整个宿主进程。
+    // 详见 doc/FFMPEG_PLAYER_ANALYSIS.md。
+    if (access("/dev/vpu_service", F_OK) != 0 && !qEnvironmentVariableIsSet("FFPLAYER_HWDEC")) {
+        spdlog::warn("VPU is unavailable, forcing FFmpeg player software decoding");
+        qputenv("FFPLAYER_HWDEC", "0");
+    }
 
     // Setup mod instances.
 
@@ -256,7 +271,9 @@ __attribute__((constructor)) static void BeforeMain() {
 
     // helper
     INSTANCE(AntiEmbs);
+    INSTANCE(CaCertificates);
     INSTANCE(DeveloperSettings);
+    INSTANCE(FontCache);
     INSTANCE(NetworkSettings);
     INSTANCE(ServiceManager);
 
@@ -286,6 +303,8 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(OcrBackend);
     INSTANCE(QueryTweaks);
     INSTANCE(TextBookHelper);
+    INSTANCE(TouchCalibration);
+    INSTANCE(VpuUnlock);
     INSTANCE(WordBookTweaks);
 
     // hitokoto

@@ -1,0 +1,299 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * YDP02X 触摸注入工具（AGENTS.md「Touch injection」一节的可执行实现）。
+ *
+ * 内核 4.4 没有 UI_DEV_SETUP / UI_ABS_SETUP，只能走 legacy uinput_user_dev 路径；
+ * 设备需要是「绝对坐标指针」（EV_ABS ABS_X/ABS_Y + BTN_LEFT，不要 INPUT_PROP_DIRECT），
+ * MT-B 触摸事件在 Weston 下到不了 Qt 客户端。
+ *
+ * 坐标：UI 逻辑点 (ux, uy)，ux∈[0,319] uy∈[0,169]
+ *   raw_x = uy, raw_y = 319 - ux
+ * 左手模式（应用自己把内容旋转 180°）时用 (319-ux, 169-uy) —— 用 --lefthand。
+ *
+ * 用法：
+ *   injector tap  ui <ux> <uy> [--lefthand]
+ *   injector swipe ui <x1> <y1> <x2> <y2> [--lefthand]
+ *   injector bksp <n>              # 退格 n 次
+ *   injector type "<ascii text>"   # 通过 uinput 键盘设备逐字符输入（小写字母/数字/空格/.-_,）
+ *   injector flicktap ui <x1> <y1> <x2> <y2> <tx> <ty> <delay_ms> [--lefthand]
+ *                                                  # 甩动后 delay_ms 再点 (tx,ty)：
+ *                                                  # 用来在「列表惯性滑行中」点某个控件，
+ *                                                  # 分两次调用时 300ms 的设备打开延迟会错过滑行窗口。
+ *   injector longtap ui <ux> <uy> [--lefthand]      # 600ms 长按
+ *   injector hold ui <ux> <uy> <ms> [--lefthand]    # 按住指定毫秒（可在此期间截图）
+ *   injector press ui <ux> <uy> [--lefthand]        # 按下不松（配合外部脚本）
+ *   injector release                                # 松开
+ */
+
+#include <fcntl.h>
+#include <linux/input.h>
+#include <linux/uinput.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+static int g_fd = -1;
+
+static void emit(int type, int code, int value) {
+    struct input_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type  = type;
+    ev.code  = code;
+    ev.value = value;
+    if (write(g_fd, &ev, sizeof(ev)) != (ssize_t)sizeof(ev)) {
+        perror("write");
+    }
+}
+
+static void move_raw(int raw_x, int raw_y) {
+    emit(EV_ABS, ABS_X, raw_x);
+    emit(EV_ABS, ABS_Y, raw_y);
+    emit(EV_SYN, SYN_REPORT, 0);
+}
+
+static void button(int down) {
+    emit(EV_KEY, BTN_LEFT, down);
+    emit(EV_SYN, SYN_REPORT, 0);
+}
+
+static void convert(int ux, int uy, int lefthand, int* raw_x, int* raw_y) {
+    if (lefthand) {
+        ux = 319 - ux;
+        uy = 169 - uy;
+    }
+    *raw_x = uy;
+    *raw_y = 319 - ux;
+}
+
+static int open_keyboard(void) {
+    g_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (g_fd < 0) {
+        perror("open /dev/uinput");
+        return -1;
+    }
+    ioctl(g_fd, UI_SET_EVBIT, EV_KEY);
+    for (int code = KEY_1; code <= KEY_0; ++code) ioctl(g_fd, UI_SET_KEYBIT, code);
+    for (int code = KEY_A; code <= KEY_Z; ++code) ioctl(g_fd, UI_SET_KEYBIT, code);
+    ioctl(g_fd, UI_SET_KEYBIT, KEY_SPACE);
+    ioctl(g_fd, UI_SET_KEYBIT, KEY_DOT);
+    ioctl(g_fd, UI_SET_KEYBIT, KEY_COMMA);
+    ioctl(g_fd, UI_SET_KEYBIT, KEY_MINUS);
+    ioctl(g_fd, UI_SET_KEYBIT, KEY_ENTER);
+    ioctl(g_fd, UI_SET_KEYBIT, KEY_BACKSPACE);
+
+    struct uinput_user_dev udev;
+    memset(&udev, 0, sizeof(udev));
+    snprintf(udev.name, UINPUT_MAX_NAME_SIZE, "penmods-keyboard");
+    udev.id.bustype = BUS_USB;
+    udev.id.vendor  = 0x1234;
+    udev.id.product = 0x5679;
+    udev.id.version = 1;
+    if (write(g_fd, &udev, sizeof(udev)) != (ssize_t)sizeof(udev)) {
+        perror("write uinput_user_dev");
+        return -1;
+    }
+    if (ioctl(g_fd, UI_DEV_CREATE) < 0) {
+        perror("UI_DEV_CREATE");
+        return -1;
+    }
+    usleep(300000); // 等 Weston 打开设备
+    return 0;
+}
+
+// 只覆盖验证界面时够用的 ASCII 子集（小写字母、数字、空格、. , -）
+static int key_code_for(char c) {
+    if (c >= 'a' && c <= 'z') return KEY_A + (c - 'a');
+    if (c >= '1' && c <= '9') return KEY_1 + (c - '1');
+    if (c == '0') return KEY_0;
+    if (c == ' ') return KEY_SPACE;
+    if (c == '.') return KEY_DOT;
+    if (c == ',') return KEY_COMMA;
+    if (c == '-') return KEY_MINUS;
+    return -1;
+}
+
+static int open_device(void) {
+    g_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (g_fd < 0) {
+        perror("open /dev/uinput");
+        return -1;
+    }
+    ioctl(g_fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(g_fd, UI_SET_KEYBIT, BTN_LEFT);
+    ioctl(g_fd, UI_SET_EVBIT, EV_ABS);
+    ioctl(g_fd, UI_SET_ABSBIT, ABS_X);
+    ioctl(g_fd, UI_SET_ABSBIT, ABS_Y);
+
+    struct uinput_user_dev udev;
+    memset(&udev, 0, sizeof(udev));
+    snprintf(udev.name, UINPUT_MAX_NAME_SIZE, "penmods-injector");
+    udev.id.bustype = BUS_USB;
+    udev.id.vendor  = 0x1234;
+    udev.id.product = 0x5678;
+    udev.id.version = 1;
+    udev.absmin[ABS_X] = 0;
+    udev.absmax[ABS_X] = 170;
+    udev.absmin[ABS_Y] = 0;
+    udev.absmax[ABS_Y] = 320;
+    if (write(g_fd, &udev, sizeof(udev)) != (ssize_t)sizeof(udev)) {
+        perror("write uinput_user_dev");
+        return -1;
+    }
+    if (ioctl(g_fd, UI_DEV_CREATE) < 0) {
+        perror("UI_DEV_CREATE");
+        return -1;
+    }
+    usleep(300000); // 等 Weston 打开设备
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s tap|longtap|swipe|flicktap|hold|press|release ui args... [--lefthand]\n"
+                        "       %s type \"<ascii text>\" | bksp <n>\n", argv[0], argv[0]);
+        return 2;
+    }
+    const char* cmd = argv[1];
+    if (strcmp(cmd, "type") == 0) {
+        const char* text = argv[2];
+        if (open_keyboard() < 0) return 1;
+        for (const char* p = text; *p; ++p) {
+            int code = key_code_for(*p);
+            if (code < 0) {
+                fprintf(stderr, "unsupported character: '%c'\n", *p);
+                continue;
+            }
+            emit(EV_KEY, code, 1);
+            emit(EV_SYN, SYN_REPORT, 0);
+            usleep(12000);
+            emit(EV_KEY, code, 0);
+            emit(EV_SYN, SYN_REPORT, 0);
+            usleep(12000);
+        }
+        usleep(60000);
+        ioctl(g_fd, UI_DEV_DESTROY);
+        close(g_fd);
+        return 0;
+    }
+
+    if (strcmp(cmd, "bksp") == 0) {
+        int count = argc > 2 ? atoi(argv[2]) : 1;
+        if (open_keyboard() < 0) return 1;
+        for (int i = 0; i < count; ++i) {
+            emit(EV_KEY, KEY_BACKSPACE, 1);
+            emit(EV_SYN, SYN_REPORT, 0);
+            usleep(12000);
+            emit(EV_KEY, KEY_BACKSPACE, 0);
+            emit(EV_SYN, SYN_REPORT, 0);
+            usleep(12000);
+        }
+        usleep(60000);
+        ioctl(g_fd, UI_DEV_DESTROY);
+        close(g_fd);
+        return 0;
+    }
+
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s tap|longtap|swipe ui args... [--lefthand]\n", argv[0]);
+        return 2;
+    }
+    int         lefthand = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--lefthand") == 0) lefthand = 1;
+    }
+
+    int ux1, uy1, ux2, uy2;
+    int is_swipe   = strcmp(cmd, "swipe") == 0;
+    int is_flicktap = strcmp(cmd, "flicktap") == 0;
+    int is_release = strcmp(cmd, "release") == 0;
+    int hold_ms    = 0;
+    if (strcmp(cmd, "hold") == 0) hold_ms = atoi(argv[5]);
+    int tap_x = 0, tap_y = 0, tap_delay_ms = 0;
+    if (is_flicktap) {
+        if (argc < 10) {
+            fprintf(stderr, "flicktap needs 4 swipe coords, 2 tap coords and a delay\n");
+            return 2;
+        }
+        ux1         = atoi(argv[3]);
+        uy1         = atoi(argv[4]);
+        ux2         = atoi(argv[5]);
+        uy2         = atoi(argv[6]);
+        tap_x       = atoi(argv[7]);
+        tap_y       = atoi(argv[8]);
+        tap_delay_ms = atoi(argv[9]);
+    } else if (is_swipe) {
+        if (argc < 7) {
+            fprintf(stderr, "swipe needs 4 coords\n");
+            return 2;
+        }
+        ux1 = atoi(argv[3]);
+        uy1 = atoi(argv[4]);
+        ux2 = atoi(argv[5]);
+        uy2 = atoi(argv[6]);
+    } else {
+        ux1 = atoi(argv[3]);
+        uy1 = atoi(argv[4]);
+        ux2 = ux1;
+        uy2 = uy1;
+    }
+
+    if (open_device() < 0) return 1;
+
+    if (is_release) {
+        button(0);
+        usleep(60000);
+        ioctl(g_fd, UI_DEV_DESTROY);
+        close(g_fd);
+        return 0;
+    }
+
+    int rx, ry, rx2, ry2;
+    convert(ux1, uy1, lefthand, &rx, &ry);
+    convert(ux2, uy2, lefthand, &rx2, &ry2);
+
+    move_raw(rx, ry);
+    usleep(50000);
+    button(1);
+
+    if (is_swipe || is_flicktap) {
+        const int steps = 24;
+        for (int i = 1; i <= steps; ++i) {
+            int x = rx + (rx2 - rx) * i / steps;
+            int y = ry + (ry2 - ry) * i / steps;
+            move_raw(x, y);
+            usleep(12000);
+        }
+    } else if (strcmp(cmd, "hold") == 0) {
+        usleep((useconds_t)hold_ms * 1000);
+    } else if (strcmp(cmd, "press") == 0) {
+        usleep(60000);
+        ioctl(g_fd, UI_DEV_DESTROY);
+        close(g_fd);
+        return 0; // 保持按下：这里其实已经松开设备，见 README 的说明
+    } else if (strcmp(cmd, "longtap") == 0) {
+        usleep(600000);
+    } else {
+        usleep(60000);
+    }
+
+    button(0);
+    usleep(60000);
+
+    if (is_flicktap) {
+        int trx, try_;
+        convert(tap_x, tap_y, lefthand, &trx, &try_);
+        usleep((useconds_t)tap_delay_ms * 1000);
+        move_raw(trx, try_);
+        usleep(30000);
+        button(1);
+        usleep(50000);
+        button(0);
+        usleep(60000);
+    }
+
+    ioctl(g_fd, UI_DEV_DESTROY);
+    close(g_fd);
+    return 0;
+}

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -21,6 +22,7 @@
 #include <QThreadPool>
 #include <QTimer>
 #include <QVector>
+#include <QUuid>
 
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
@@ -45,6 +47,9 @@ struct MessagePart {
 
 // 单条消息（纯文本或多模态）
 struct MessageData {
+    QString              messageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // Local display metadata. messageToJson deliberately excludes these fields.
+    QVariantList         toolStates;
     QString              role;          // "user" | "assistant" | "system" | "tool"
     QString              content;       // 纯文本（无多模态时使用）
     QString              reasoning;     // 模型推理摘要（不发送回 API）
@@ -76,6 +81,8 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(bool isStreaming READ getIsStreaming WRITE setIsStreaming NOTIFY isStreamingChanged)
     Q_PROPERTY(bool isAvailable READ isAvailable CONSTANT)
     Q_PROPERTY(QVariantList messages READ getMessages NOTIFY messagesChanged)
+    Q_PROPERTY(QString responseMessageId READ responseMessageId NOTIFY streamStart)
+    Q_PROPERTY(QVariantList toolStates READ getToolStates NOTIFY toolStatesChanged)
     Q_PROPERTY(QString currentSessionId READ getCurrentSessionId NOTIFY sessionSwitched)
     Q_PROPERTY(QVariantMap apiCacheStats READ getApiCacheStats NOTIFY apiCacheStatsChanged)
 
@@ -95,6 +102,12 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
         QString proxyVisionPrompt READ getProxyVisionPrompt WRITE setProxyVisionPrompt NOTIFY proxyVisionSettingsChanged
     )
 
+    // 网络搜索（provider: off | tavily | deepseek）
+    Q_PROPERTY(QString searchProvider READ getSearchProvider WRITE setSearchProvider NOTIFY searchConfigChanged)
+    Q_PROPERTY(bool searchEnabled READ getSearchEnabled WRITE setSearchEnabled NOTIFY searchConfigChanged)
+    Q_PROPERTY(bool searchConfigured READ getSearchConfigured NOTIFY searchConfigChanged)
+    Q_PROPERTY(int searchCount READ getSearchCount WRITE setSearchCount NOTIFY searchConfigChanged)
+    // 兼容旧版外部资源库（libPenModsResources.so 可能先于主库被替换）
     Q_PROPERTY(bool tavilyEnabled READ getTavilyEnabled WRITE setTavilyEnabled NOTIFY tavilyConfigChanged)
     Q_PROPERTY(bool tavilyConfigured READ getTavilyConfigured NOTIFY tavilyConfigChanged)
 
@@ -122,10 +135,13 @@ public:
     Q_INVOKABLE void    cancelMarkdownParse(const QString& requestId);
     Q_INVOKABLE void    truncateHistory(int index);
     Q_INVOKABLE void    editMessage(int index, const QString& newContent);
-    Q_INVOKABLE void    deleteMessage(int index);
-    Q_INVOKABLE void    regenerateMessage(int index);
-    Q_INVOKABLE void    cancelRequest();
-    Q_INVOKABLE void    resetApiCacheStats();
+    // 带媒体的编辑：mediaParts 是编辑后仍在的图片（[{type,url,localPath,name,mimeType}]，
+    // url 可为空、只给 localPath）。独立函数而非默认参数：QML 按实参个数分派会解析失败。
+    Q_INVOKABLE void editMessageWithMedia(int index, const QString& newContent, const QString& mediaParts);
+    Q_INVOKABLE void deleteMessage(int index);
+    Q_INVOKABLE void regenerateMessage(int index);
+    Q_INVOKABLE void cancelRequest();
+    Q_INVOKABLE void resetApiCacheStats();
 
     // Tool Call 接口
     Q_INVOKABLE void submitToolResult(const QString& toolCallId, const QString& toolName, const QString& result);
@@ -160,7 +176,10 @@ public:
     Q_INVOKABLE bool    setActivePrompt(const QString& promptId);
     Q_INVOKABLE QString getActivePrompt();
 
-    // Tavily 网络搜索
+    // 网络搜索
+    Q_INVOKABLE QString getSearchConfig();
+    Q_INVOKABLE void    setSearchConfig(const QString& configJson);
+    // 旧接口别名，等价于 getSearchConfig/setSearchConfig 的 tavily 子集
     Q_INVOKABLE QString getTavilyConfig();
     Q_INVOKABLE void    setTavilyConfig(const QString& configJson);
 
@@ -177,6 +196,8 @@ public:
     QString      getDefaultPrompt() const;
     bool         getIsStreaming() const;
     QVariantList getMessages() const;
+    QString responseMessageId() const { return m_responseMessageId; }
+    QVariantList getToolStates() const;
     QVariantMap  getApiCacheStats() const;
 
     bool getCapText() const { return m_capText; }
@@ -191,8 +212,16 @@ public:
     QString getProxyVisionPrompt() const { return m_proxyVisionPrompt; }
     void    setProxyVisionPrompt(const QString& v);
 
-    bool getTavilyEnabled() const { return m_tavilyEnabled; }
-    bool getTavilyConfigured() const { return !m_tavilyApiKey.isEmpty(); }
+    QString getSearchProvider() const { return m_searchProvider; }
+    bool    getSearchEnabled() const { return m_searchEnabled; }
+    bool    getSearchConfigured() const { return searchConfigured(); }
+    int     getSearchCount() const { return m_searchCount; }
+    void    setSearchProvider(const QString& provider);
+    void    setSearchEnabled(bool v);
+    void    setSearchCount(int count);
+
+    bool getTavilyEnabled() const { return m_searchProvider == "tavily" && m_searchEnabled; }
+    bool getTavilyConfigured() const { return !m_searchTavilyKey.isEmpty(); }
     void setTavilyEnabled(bool v);
 
     bool getShellToolEnabled() const { return m_shellToolEnabled; }
@@ -223,6 +252,8 @@ signals:
     void requestCancelled();
     // Tool Call 信号：toolCallsJson 为完整 tool_calls 数组的 JSON 字符串
     void toolCallReceived(const QString& toolCallsJson);
+    void toolStateChanged(const QVariantMap& state);
+    void toolStatesChanged();
     void imageAttachmentsReceived(const QVariantList& attachments);
     void toolCallProgress(const QString& text, bool isComplete);
     void apiKeyChanged();
@@ -242,6 +273,10 @@ signals:
     void proxyVisionSettingsChanged();
     void proxyVisionStarted();
     void proxyVisionCompleted(const QString& description);
+    void searchConfigChanged();
+    void webSearchStarted(const QString& toolCallId, const QString& query);
+    void webSearchFinished(const QString& toolCallId, bool success, const QString& summary, const QString& resultText);
+    // 旧信号：新资源库已改用 webSearch*，这里仍照常发出，旧版资源库可继续工作
     void tavilyConfigChanged();
     void tavilySearchStarted(const QString& toolCallId, const QString& query);
     void
@@ -271,6 +306,18 @@ private:
     bool                   m_cancelled        = false;
     bool                   m_streamEndEmitted = false;
     int                    m_requestSeq       = 0;
+    QString                m_responseMessageId;
+    QString                m_responseSessionId;
+    QVariantList           m_responseToolStates;
+    bool                   m_toolFlushScheduled = false;
+    void prepareTool(int index, const json& call);
+    void updateTool(const QString& callId, const QString& state, const QString& text,
+                    const QString& result = QString());
+    void publishTool(QVariantMap state);
+    void finishOutstandingTools(const QString& state, const QString& reason);
+    void updateServerTool(const QJsonObject& item, const QString& state);
+    void attachResponseMetadata(MessageData& message) const;
+    void persistPartialResponse();
 
     QString m_apiKey;
     QString m_apiEndpoint;
@@ -325,7 +372,11 @@ private:
     void       handleNetworkReply(QNetworkReply* reply, bool isStream);
     void       finishStream();
     void       emitContentChunk(const QString& content);
+    void       appendAnswerChunk(const QString& text);
+    void       appendReasoningChunk(const QString& text);
     void       flushEmbeddedContent();
+    void       reclassifyFinalAnswer();
+    QJsonArray buildApiMessagesFromHistory();
     void       recordApiUsage(const QJsonObject& usage);
     bool       usesResponsesApi() const;
     QJsonArray messagesToResponsesInput(const QJsonArray& messages) const;
@@ -360,18 +411,33 @@ private:
     void initPrompts();
     void savePrompts();
 
-    // Tavily 网络搜索
-    QString m_tavilyApiKey;
-    QString m_tavilySearchDepth;
-    int     m_tavilyMaxResults = 5;
-    bool    m_tavilyEnabled    = false;
+    // 网络搜索
+    QString m_searchProvider    = "off"; // off | tavily | deepseek
+    bool    m_searchEnabled     = false;
+    int     m_searchCount       = 5;
+    bool    m_searchNeedContent = false;
+    int     m_searchMaxChars    = 6000;
+    QString m_searchTavilyKey;
+    QString m_searchTavilyDepth = "advanced";
+    QString m_searchDeepseekKey;
+    QString m_searchDeepseekBaseUrl = "https://api.deepseek.com";
 
-    void                 initTavily();
-    void                 injectToolDefinitions(QJsonObject& requestBody);
+    void    initSearch();
+    void    saveSearchConfig();
+    bool    searchConfigured() const;
+    bool    searchToolAvailable() const;
+    QString effectiveSearchKey() const;
+    QString formatSearchResults(const QString& query, const QJsonArray& results, bool includeContent) const;
+    void    injectToolDefinitions(QJsonObject& requestBody);
     QVector<MessagePart> persistGeneratedImages(const QJsonArray& output);
+    // 视觉代理路径专用：原图落盘成会话附件（仅本地查看，不发给主模型）
+    QVector<MessagePart> persistUserImages(const QVector<MessagePart>& parts, const QString& sessionId);
     QVariantList         attachmentVariants(const QVector<MessagePart>& parts) const;
     void                 dispatchToolCalls(const QString& toolCallsJson);
+    void                 executeWebSearch(const QString& toolCallId, const QString& query);
     void                 executeTavilySearch(const QString& toolCallId, const QString& query);
+    void                 executeDeepSeekSearch(const QString& toolCallId, const QString& query);
+    void                 requestDeepSeekSearch(const QString& toolCallId, const QString& query, int attempt);
 
     // Shell tool
     bool        m_shellToolEnabled   = false;
@@ -400,6 +466,7 @@ private:
     bool    isCommandBlocked(const QString& command);
     void    executeShellCommand(const QString& toolCallId, const QString& command);
     void    cleanupShellExec(const QString& toolCallId);
+    void    abortPendingShellExecs(const QString& reason);
     QString truncateOutput(const QString& output, int maxBytes);
 
     // 数学公式渲染
@@ -420,6 +487,7 @@ private:
 
     void submitToolResultBatched(const QString& toolCallId, const QString& toolName, const QString& result);
     void tryFlushToolBatch();
+    void resolvePendingToolCalls(const QString& reason);
 
     void callVisionProxy(
         const QString&              message,
@@ -431,7 +499,9 @@ private:
         const QString&              message,
         const QVector<MessagePart>& parts,
         const QString&              effectiveMessage,
-        const QString&              sessionId
+        const QString&              sessionId,
+        // 仅本地查看的附件（视觉代理路径下的用户原图）：落盘后进历史，但不进这一轮的请求
+        const QVector<MessagePart>& localOnlyParts = {}
     );
 };
 

@@ -31,6 +31,7 @@
 #include <QQmlContext>
 #include <QRegularExpression>
 #include <QRunnable>
+#include <QSaveFile>
 #include <QTextDocument>
 #include <QTextStream>
 #include <QTimer>
@@ -204,7 +205,7 @@ ChatBot::ChatBot()
   m_networkManager(new QNetworkAccessManager(this)),
   m_apiKey(""),
   m_apiEndpoint("https://api.deepseek.com/v1/chat/completions"),
-  m_model("deepseek-v4-flash"),
+  m_model("deepseek-flash"),
   m_temperature(0.7),
   m_defaultPrompt("你是一个有用的助手，使用中文回复用户的问题。"),
   m_isStreaming(true),
@@ -229,10 +230,32 @@ ChatBot::ChatBot()
 
     initModels();
     initPrompts();
-    initTavily();
+    initSearch();
     initShellTool();
     initMathRender();
     initSessions();
+    connect(this, &ChatBot::messagesChanged, this, &ChatBot::toolStatesChanged);
+    connect(this, &ChatBot::errorOccurred, this, [this](const QString& reason) {
+        finishOutstandingTools("error", reason);
+        persistPartialResponse();
+    });
+    connect(this, &ChatBot::webSearchStarted, this, [this](const QString& id, const QString& query) {
+        updateTool(id, "running", "正在搜索：" + query);
+    });
+    connect(this, &ChatBot::shellCommandPending, this, [this](const QString& id, const QString& command) {
+        updateTool(id, "pending", "请求执行：" + command, command);
+    });
+    connect(this, &ChatBot::shellCommandStarted, this, [this](const QString& id, const QString& command) {
+        updateTool(id, "running", "正在执行：" + command, command);
+    });
+    connect(this, &ChatBot::webSearchFinished, this,
+            [this](const QString& id, bool ok, const QString& summary, const QString& result) {
+        updateTool(id, ok ? "done" : "error", (ok ? "搜索完成：" : "搜索失败：") + summary, result);
+    });
+    connect(this, &ChatBot::shellCommandFinished, this,
+            [this](const QString& id, bool ok, const QString& summary, const QString& result) {
+        updateTool(id, ok ? "done" : "error", (ok ? "执行完成：" : "执行失败：") + summary, result);
+    });
 }
 
 ChatBot::~ChatBot() {
@@ -281,7 +304,7 @@ void ChatBot::reloadConfig() {
 
     initModels();
     initPrompts();
-    initTavily();
+    initSearch();
     initShellTool();
     initMathRender();
 
@@ -310,7 +333,7 @@ void ChatBot::sanitizeConfig() {
 
     initModels();
     initPrompts();
-    initTavily();
+    initSearch();
     initShellTool();
     initMathRender();
 
@@ -348,13 +371,18 @@ QJsonObject ChatBot::messageToJson(const MessageData& msg) const {
         QJsonArray contentArr;
         for (const auto& part : msg.parts) {
             if (part.type == "file") continue;
+            // 活动模型不支持视觉时不发历史里的图（视觉代理下原图仅本地查看，发给文字模型会被拒）。
+            if (part.type == "image_url" && !m_capVision) continue;
             QJsonObject p;
             p["type"] = part.type;
             if (part.type == "text") {
                 p["text"] = part.text;
             } else if (part.type == "image_url") {
+                const QString url = AttachmentManager::requestUrl(part);
+                // 附件被删/搬走后 requestUrl 返回空串，发空 url 会让本会话后续每条请求都 400，宁可少发。
+                if (url.isEmpty()) continue;
                 QJsonObject imgUrl;
-                imgUrl["url"]  = AttachmentManager::requestUrl(part);
+                imgUrl["url"]  = url;
                 p["image_url"] = imgUrl;
             } else if (part.type == "input_audio") {
                 QJsonObject audio;
@@ -376,6 +404,10 @@ QJsonObject ChatBot::messageToJson(const MessageData& msg) const {
 // 构建 API messages 数组
 // -----------------------------------------------------------------------
 
+namespace {
+void normalizeToolMessageSequence(QJsonArray& messages);
+} // namespace
+
 QJsonArray ChatBot::buildApiMessages(
     const QVector<MessageData>& history,
     const QString&              userText,
@@ -391,6 +423,7 @@ QJsonArray ChatBot::buildApiMessages(
 
     // history
     for (const auto& msg : history) {
+        if (msg.role == "assistant" && msg.content.isEmpty() && msg.toolCallsJson.isEmpty() && msg.parts.isEmpty()) continue;
         messages.append(messageToJson(msg));
     }
 
@@ -411,7 +444,23 @@ QJsonArray ChatBot::buildApiMessages(
     }
     messages.append(messageToJson(userMsg));
 
+    normalizeToolMessageSequence(messages);
+
     return messages;
+}
+
+QJsonArray ChatBot::buildApiMessagesFromHistory() {
+    QJsonArray  apiMessages;
+    QJsonObject sysMsg;
+    sysMsg["role"]    = "system";
+    sysMsg["content"] = m_defaultPrompt;
+    apiMessages.append(sysMsg);
+    for (const auto& msg : currentMessages()) {
+        if (msg.role == "assistant" && msg.content.isEmpty() && msg.toolCallsJson.isEmpty() && msg.parts.isEmpty()) continue;
+        apiMessages.append(messageToJson(msg));
+    }
+    normalizeToolMessageSequence(apiMessages);
+    return apiMessages;
 }
 
 // -----------------------------------------------------------------------
@@ -449,6 +498,9 @@ QString ChatBot::sessionsFilePath() {
 
 static json messageDataToJson(const MessageData& msg) {
     json obj;
+    obj["messageId"] = msg.messageId.toStdString();
+    if (!msg.toolStates.isEmpty())
+        obj["toolStates"] = json::parse(QJsonDocument::fromVariant(msg.toolStates).toJson().toStdString());
     obj["role"]    = msg.role.toStdString();
     obj["content"] = msg.content.toStdString();
     if (!msg.toolCallId.isEmpty()) obj["toolCallId"] = msg.toolCallId.toStdString();
@@ -480,6 +532,10 @@ static json messageDataToJson(const MessageData& msg) {
 
 static MessageData messageDataFromJson(const json& obj) {
     MessageData msg;
+    if (obj.contains("messageId") && obj["messageId"].is_string() && !obj["messageId"].get<std::string>().empty())
+        msg.messageId = QString::fromStdString(obj["messageId"]);
+    if (obj.contains("toolStates") && obj["toolStates"].is_array())
+        msg.toolStates = QJsonDocument::fromJson(QByteArray::fromStdString(obj["toolStates"].dump())).toVariant().toList();
     msg.role    = QString::fromStdString(obj.value("role", ""));
     msg.content = QString::fromStdString(obj.value("content", ""));
     if (obj.contains("toolCallId")) msg.toolCallId = QString::fromStdString(obj["toolCallId"]);
@@ -513,6 +569,11 @@ static MessageData messageDataFromJson(const json& obj) {
     return msg;
 }
 
+// 工具调用被取消或未完成时的占位结果
+static QString pendingToolResultText() {
+    return QStringLiteral("该工具调用已被用户取消或未完成，请直接根据已有信息继续回答，不要重复调用该工具。");
+}
+
 static bool sanitizeMessageHistory(MessageData& msg) {
     bool removedImage = false;
     msg.parts.erase(
@@ -541,6 +602,95 @@ static bool sanitizeMessageHistory(MessageData& msg) {
     return true;
 }
 
+// 修复历史里损坏的工具调用组
+static bool normalizeHistoryMessages(QVector<MessageData>& messages, int* droppedOrphans = nullptr) {
+    QVector<MessageData> result;
+    bool                 changed = false;
+
+    for (int index = 0; index < messages.size(); ++index) {
+        const MessageData& message = messages.at(index);
+
+        if (message.role == "tool") {
+            if (droppedOrphans) ++(*droppedOrphans);
+            changed = true;
+            continue;
+        }
+
+        if (message.role != "assistant" || message.toolCallsJson.isEmpty()) {
+            result.append(message);
+            continue;
+        }
+
+        QVector<MessageData> following;
+        int                  next = index + 1;
+        while (next < messages.size() && messages.at(next).role == "tool") {
+            following.append(messages.at(next));
+            ++next;
+        }
+
+        const QJsonArray     calls = QJsonDocument::fromJson(message.toolCallsJson.toUtf8()).array();
+        QJsonArray           validCalls;
+        QSet<QString>        seenIds;
+        QVector<MessageData> resolved;
+
+        for (const QJsonValue& callValue : calls) {
+            const QJsonObject call = callValue.toObject();
+            const QString     id   = call.value(QLatin1String("id")).toString().trimmed();
+            if (id.isEmpty() || seenIds.contains(id)) {
+                changed = true;
+                continue;
+            }
+            seenIds.insert(id);
+            validCalls.append(call);
+
+            bool answered = false;
+            for (const auto& candidate : following) {
+                if (candidate.toolCallId != id) continue;
+                resolved.append(candidate);
+                answered = true;
+                break;
+            }
+            if (answered) continue;
+
+            MessageData placeholder;
+            placeholder.role       = "tool";
+            placeholder.toolCallId = id;
+            placeholder.content    = pendingToolResultText();
+            for (const auto& value : message.toolStates) {
+                const auto state = value.toMap();
+                if (state.value("callId").toString() == id && !state.value("result").toString().isEmpty()) {
+                    placeholder.content = state.value("result").toString();
+                    break;
+                }
+            }
+            resolved.append(placeholder);
+            changed = true;
+        }
+        if (resolved.size() != following.size()) changed = true;
+
+        MessageData assistant = message;
+        if (validCalls.isEmpty()) {
+            assistant.toolCallsJson.clear();
+            changed = true;
+            if (assistant.content.isEmpty() && assistant.parts.isEmpty()) {
+                index = next - 1;
+                continue;
+            }
+        } else {
+            const QString normalized = QString::fromUtf8(QJsonDocument(validCalls).toJson(QJsonDocument::Compact));
+            if (normalized != assistant.toolCallsJson) changed = true;
+            assistant.toolCallsJson = normalized;
+        }
+
+        result.append(assistant);
+        result += resolved;
+        index   = next - 1;
+    }
+
+    messages = result;
+    return changed;
+}
+
 // -----------------------------------------------------------------------
 // 保存 sessions.json
 // -----------------------------------------------------------------------
@@ -567,10 +717,15 @@ void ChatBot::saveSessions() {
     }
     root["sessions"] = sessionsArr;
 
-    QFile file(sessionsFilePath());
-    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        file.write(root.dump(4).c_str());
-        file.close();
+    // QSaveFile 先写临时文件再改名，否则写盘期间掉电/被杀会把 sessions.json 截断成半个文件，
+    // 下次启动解析失败 → 全部会话丢失。
+    QSaveFile file(sessionsFilePath());
+    if (file.open(QIODevice::WriteOnly)) {
+        const std::string payload = root.dump(4);
+        file.write(payload.c_str(), static_cast<qint64>(payload.size()));
+        if (!file.commit()) {
+            error("提交 sessions.json 失败: {}", sessionsFilePath().toStdString());
+        }
     } else {
         error("无法写入 sessions.json: {}", sessionsFilePath().toStdString());
     }
@@ -599,23 +754,21 @@ void ChatBot::initSessions() {
 
                     if (sessionObj.contains("messages") && sessionObj["messages"].is_array()) {
                         for (const auto& msgObj : sessionObj["messages"]) {
-                            // 兼容旧格式 {role, content}
-                            if (msgObj.contains("role") && !msgObj.contains("parts")) {
-                                MessageData msg;
-                                msg.role    = QString::fromStdString(msgObj.value("role", ""));
-                                msg.content = QString::fromStdString(msgObj.value("content", ""));
-                                if (msgObj.contains("toolCallId"))
-                                    msg.toolCallId = QString::fromStdString(msgObj["toolCallId"]);
-                                if (msgObj.contains("toolCallsJson"))
-                                    msg.toolCallsJson = QString::fromStdString(msgObj["toolCallsJson"]);
-                                if (msgObj.contains("reasoning"))
-                                    msg.reasoning = QString::fromStdString(msgObj["reasoning"]);
-                                session.messages.append(msg);
-                            } else {
-                                MessageData msg   = messageDataFromJson(msgObj);
-                                historySanitized |= sanitizeMessageHistory(msg);
-                                session.messages.append(msg);
+                            MessageData msg = messageDataFromJson(msgObj);
+                            historySanitized |= !msgObj.contains("messageId");
+                            historySanitized |= sanitizeMessageHistory(msg);
+                            // A process restart cannot resume pending tool executions.
+                            for (auto& value : msg.toolStates) {
+                                auto state = value.toMap();
+                                const auto status = state.value("state").toString();
+                                if (status != "done" && status != "error" && status != "cancelled") {
+                                    state["state"] = "cancelled";
+                                    state["text"] = "调用已中断";
+                                    value = state;
+                                    historySanitized = true;
+                                }
                             }
+                            session.messages.append(msg);
                         }
                     }
 
@@ -633,6 +786,39 @@ void ChatBot::initSessions() {
                         session.messages.end()
                     );
                     historySanitized |= session.messages.size() != oldSize;
+                    // 修复历史里损坏的工具调用组
+                    int droppedOrphans  = 0;
+                    historySanitized   |= normalizeHistoryMessages(session.messages, &droppedOrphans);
+                    QSet<QString> messageIds;
+                    for (int i = 0; i < session.messages.size(); ++i) {
+                        auto& message = session.messages[i];
+                        if (message.messageId.isEmpty() || messageIds.contains(message.messageId)) {
+                            message.messageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+                            historySanitized = true;
+                        }
+                        messageIds.insert(message.messageId);
+                        if (message.role != "assistant" || message.toolCallsJson.isEmpty() || !message.toolStates.isEmpty()) continue;
+                        const auto calls = QJsonDocument::fromJson(message.toolCallsJson.toUtf8()).array();
+                        for (int c = 0; c < calls.size(); ++c) {
+                            const auto call = calls[c].toObject();
+                            const auto id = call["id"].toString();
+                            QString result;
+                            for (int k = i + 1; k < session.messages.size() && session.messages[k].role == "tool"; ++k)
+                                if (session.messages[k].toolCallId == id) result = session.messages[k].content;
+                            const bool cancelled = result.contains("取消") || result.contains("中断") || result.contains("拒绝");
+                            // Old sessions did not persist success. Keep the uncertainty visible.
+                            message.toolStates.append(QVariantMap{
+                                {"key", message.messageId + ":tool:" + QString::number(c)},
+                                {"batchId", message.messageId}, {"sessionId", session.id}, {"callId", id},
+                                {"name", call["function"].toObject()["name"].toString()},
+                                {"arguments", call["function"].toObject()["arguments"].toString()},
+                                {"state", cancelled ? "cancelled" : "error"},
+                                {"text", cancelled ? "历史调用已取消" : "历史调用（状态未记录）"}, {"result", result}});
+                            historySanitized = true;
+                        }
+                    }
+                    if (droppedOrphans > 0)
+                        warn("会话 {} 丢弃了 {} 条找不到宿主的工具结果", session.id.toStdString(), droppedOrphans);
                     if (!session.id.isEmpty()) m_sessions.insert(session.id, session);
                 }
             }
@@ -761,9 +947,7 @@ void ChatBot::sendMessage(const QString& message, const QString& fileRefs) {
 
 // -----------------------------------------------------------------------
 // sendMessageWithMedia（多模态：图片 / 音频）
-// mediaParts JSON 格式（数组）：
-//   [{"type":"image_url","url":"https://..."},
-//    {"type":"input_audio","data":"<base64>","format":"mp3"}]
+// mediaParts: 图片 {type,url} / 音频 {type,data,format}
 // -----------------------------------------------------------------------
 
 void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaParts) {
@@ -854,7 +1038,8 @@ void ChatBot::finishMediaMessage(
     const QString&              message,
     const QVector<MessagePart>& parts,
     const QString&              effectiveMessage,
-    const QString&              sessionId
+    const QString&              sessionId,
+    const QVector<MessagePart>& localOnlyParts
 ) {
     if (m_cancelled || sessionId != m_currentSessionId || !m_sessions.contains(sessionId)) {
         warn("多模态消息已失效，会话已切换或请求已取消");
@@ -867,7 +1052,7 @@ void ChatBot::finishMediaMessage(
 
     QJsonArray apiMessages = buildApiMessages(m_sessions[sessionId].messages, effectiveMessage, parts);
 
-    // 内嵌图片只保留在本次请求中，避免 Base64 被写入历史并在后续请求中反复复制。
+    // 内嵌图片先落盘为附件，不写入历史
     const bool hadImage =
         std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) { return part.type == "image_url"; });
     QVector<MessagePart> historyParts   = parts;
@@ -891,6 +1076,10 @@ void ChatBot::finishMediaMessage(
         ),
         historyParts.end()
     );
+
+    // 视觉代理路径：原图不进这一轮请求，但必须落盘进历史，否则气泡里的图在轮末按历史重建时
+    // 会消失（发给模型时由 messageToJson 按"活动模型不支持视觉"跳过）。
+    for (const auto& part : persistUserImages(localOnlyParts, sessionId)) historyParts.append(part);
 
     MessageData userMsg;
     userMsg.role    = "user";
@@ -919,7 +1108,6 @@ void ChatBot::finishMediaMessage(
 
 // -----------------------------------------------------------------------
 // callVisionProxy: 用视觉代理模型异步提取图片文字描述
-// 自动检测 OpenAI / Anthropic 格式
 // -----------------------------------------------------------------------
 
 void ChatBot::callVisionProxy(
@@ -954,7 +1142,8 @@ void ChatBot::callVisionProxy(
         );
         showToast("视觉代理模型配置无效，已仅发送文字");
         emit proxyVisionCompleted(QString());
-        finishMediaMessage(message, fallbackParts, "[图片分析失败]\n" + message, sessionId);
+        // 末参数 = 仅本地查看的原图：代理失败也要让用户能点开自己发的图
+        finishMediaMessage(message, fallbackParts, "[图片分析失败]\n" + message, sessionId, parts);
         return;
     }
 
@@ -1125,13 +1314,145 @@ void ChatBot::callVisionProxy(
         }
 
         reply->deleteLater();
-        finishMediaMessage(message, nextParts, effectiveMessage, sessionId);
+        // 末参数 = 仍带 data URL 的原图，落盘后进历史（见 persistUserImages）。
+        finishMediaMessage(message, nextParts, effectiveMessage, sessionId, parts);
     });
 }
 
 // -----------------------------------------------------------------------
 // submitToolResult：将工具调用结果提交给模型
 // -----------------------------------------------------------------------
+
+// Display state is scoped to a response and session, independently of API call IDs.
+static bool toolTerminal(const QString& state) {
+    return state == "done" || state == "error" || state == "cancelled";
+}
+
+void ChatBot::attachResponseMetadata(MessageData& message) const {
+    message.messageId = m_responseMessageId;
+    message.toolStates = m_responseToolStates;
+}
+
+void ChatBot::persistPartialResponse() {
+    if (m_responseMessageId.isEmpty() || m_responseSessionId != m_currentSessionId) return;
+    for (const auto& message : currentMessages())
+        if (message.messageId == m_responseMessageId) return;
+    if (m_currentStreamBuffer.isEmpty() && m_currentReasoningBuffer.isEmpty() && m_responseToolStates.isEmpty()) return;
+    MessageData message;
+    message.role = "assistant";
+    message.content = m_currentStreamBuffer;
+    message.reasoning = m_currentReasoningBuffer;
+    attachResponseMetadata(message);
+    currentMessages().append(message);
+    saveSessions();
+    emit messagesChanged();
+}
+
+QVariantList ChatBot::getToolStates() const {
+    QVariantList states;
+    for (const auto& message : currentMessages()) states += message.toolStates;
+    if (m_responseSessionId == m_currentSessionId && (!m_activeReplies.isEmpty() || !m_toolCallBatch.isEmpty())) {
+        for (const auto& value : m_responseToolStates) {
+            bool found = false;
+            for (const auto& stored : states)
+                found |= stored.toMap().value("key") == value.toMap().value("key");
+            if (!found) states.append(value);
+        }
+    }
+    return states;
+}
+
+void ChatBot::publishTool(QVariantMap state) {
+    if (m_responseSessionId != m_currentSessionId) return;
+    bool found = false;
+    for (auto& value : m_responseToolStates) {
+        const auto old = value.toMap();
+        if (old.value("key") != state.value("key")) continue;
+        if (toolTerminal(old.value("state").toString())) return;
+        value = state;
+        found = true;
+        break;
+    }
+    if (!found) m_responseToolStates.append(state);
+    bool persisted = false;
+    for (auto& message : currentMessages()) {
+        if (message.messageId != m_responseMessageId) continue;
+        message.toolStates = m_responseToolStates;
+        persisted = true;
+        break;
+    }
+    // Save terminal states before a continuation can fail or the page is reopened.
+    if (persisted && toolTerminal(state.value("state").toString())) saveSessions();
+    emit toolStateChanged(state);
+    emit toolStatesChanged();
+}
+
+void ChatBot::prepareTool(int index, const json& call) {
+    const auto fn = call.contains("function") && call["function"].is_object() ? call["function"] : json::object();
+    const auto name = fn.contains("name") && fn["name"].is_string()
+        ? QString::fromStdString(fn["name"].get<std::string>()) : QString();
+    const auto arguments = fn.contains("arguments") && fn["arguments"].is_string()
+        ? QString::fromStdString(fn["arguments"].get<std::string>()) : QString();
+    const auto callId = QString::fromStdString(call.value("id", ""));
+    auto key = m_responseMessageId + ":tool:" + QString::number(index);
+    if (!callId.isEmpty()) {
+        for (const auto& value : m_responseToolStates) {
+            const auto previous = value.toMap();
+            if (!previous.value("server").toBool() && previous.value("callId").toString() == callId) {
+                key = previous.value("key").toString();
+                break;
+            }
+        }
+    }
+    QVariantMap state{
+        {"key", key},
+        {"batchId", m_responseMessageId}, {"sessionId", m_currentSessionId},
+        {"callId", callId},
+        {"name", name}, {"arguments", arguments},
+        {"state", "preparing"}, {"text", "准备调用：" + (name.isEmpty() ? QString("工具") : name)},
+        {"result", ""}, {"server", false}
+    };
+    publishTool(state);
+}
+
+void ChatBot::updateTool(const QString& callId, const QString& status, const QString& text, const QString& result) {
+    for (const auto& value : m_responseToolStates) {
+        auto state = value.toMap();
+        if (state.value("callId").toString() != callId || state.value("server").toBool()) continue;
+        state["state"] = status;
+        state["text"] = text;
+        state["result"] = result;
+        publishTool(state);
+        return;
+    }
+}
+
+void ChatBot::finishOutstandingTools(const QString& status, const QString& reason) {
+    const auto states = m_responseToolStates;
+    for (const auto& value : states) {
+        auto state = value.toMap();
+        if (toolTerminal(state.value("state").toString())) continue;
+        state["state"] = status;
+        state["text"] = reason;
+        state["result"] = reason;
+        publishTool(state);
+    }
+}
+
+void ChatBot::updateServerTool(const QJsonObject& item, const QString& status) {
+    const auto id = item["id"].toString();
+    if (id.isEmpty()) return;
+    const auto name = item["type"].toString();
+    auto details = item;
+    // Generated image data belongs in AttachmentManager, never in sessions.json
+    // or the tool card's JSON display metadata.
+    if (name == "image_generation_call") details.remove("result");
+    publishTool({{"key", m_responseMessageId + ":server:" + id}, {"callId", id},
+                 {"batchId", m_responseMessageId}, {"sessionId", m_currentSessionId},
+                 {"name", name}, {"server", true}, {"state", status},
+                 {"text", (status == "done" ? "已完成：" : status == "error" ? "执行失败：" : "正在执行：") + name},
+                 {"result", QString::fromUtf8(QJsonDocument(details).toJson(QJsonDocument::Compact))}});
+}
 
 void ChatBot::submitToolResult(const QString& toolCallId, const QString& toolName, const QString& result) {
     MessageData toolMsg;
@@ -1141,15 +1462,8 @@ void ChatBot::submitToolResult(const QString& toolCallId, const QString& toolNam
     currentMessages().append(toolMsg);
     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
 
-    // 以当前历史重新发起请求（工具结果作为最后一条 history 消息，不再追加新 user 消息）
-    QJsonArray  apiMessages;
-    QJsonObject sysMsg;
-    sysMsg["role"]    = "system";
-    sysMsg["content"] = m_defaultPrompt;
-    apiMessages.append(sysMsg);
-    for (const auto& msg : currentMessages()) {
-        apiMessages.append(messageToJson(msg));
-    }
+    // 以当前历史重新发起请求
+    QJsonArray apiMessages = buildApiMessagesFromHistory();
 
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
@@ -1159,18 +1473,32 @@ void ChatBot::submitToolResult(const QString& toolCallId, const QString& toolNam
 }
 
 void ChatBot::submitToolResultBatched(const QString& toolCallId, const QString& toolName, const QString& result) {
+    bool accepted = false;
     for (auto& entry : m_toolCallBatch) {
-        if (entry.id == toolCallId) {
+        if (entry.id == toolCallId && !entry.resolved) {
+            accepted = true;
             entry.resolved = true;
             entry.result   = result;
             break;
         }
     }
-    tryFlushToolBatch();
+    if (!accepted) return;
+    if (!m_toolFlushScheduled) {
+        m_toolFlushScheduled = true;
+        const auto batch = m_responseMessageId;
+        const auto session = m_currentSessionId;
+        const auto seq = m_requestSeq;
+        QTimer::singleShot(0, this, [this, batch, session, seq]() {
+            if (seq != m_requestSeq || batch != m_responseMessageId || session != m_currentSessionId) return;
+            m_toolFlushScheduled = false;
+            tryFlushToolBatch();
+        });
+    }
 }
 
 void ChatBot::tryFlushToolBatch() {
     if (m_cancelled) return;
+    if (m_toolCallBatch.isEmpty()) return;
 
     for (const auto& entry : m_toolCallBatch) {
         if (!entry.resolved) return;
@@ -1187,14 +1515,7 @@ void ChatBot::tryFlushToolBatch() {
     }
     m_toolCallBatch.clear();
 
-    QJsonArray  apiMessages;
-    QJsonObject sysMsg;
-    sysMsg["role"]    = "system";
-    sysMsg["content"] = m_defaultPrompt;
-    apiMessages.append(sysMsg);
-    for (const auto& msg : currentMessages()) {
-        apiMessages.append(messageToJson(msg));
-    }
+    QJsonArray apiMessages = buildApiMessagesFromHistory();
 
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
@@ -1202,6 +1523,29 @@ void ChatBot::tryFlushToolBatch() {
     emit toolBatchFlushed();
 
     makeApiRequest(apiMessages);
+}
+
+// 把尚未落库的工具调用结果补进历史
+void ChatBot::resolvePendingToolCalls(const QString& reason) {
+    if (m_toolCallBatch.isEmpty()) return;
+
+    bool appended = false;
+    for (const auto& entry : m_toolCallBatch) {
+        if (entry.id.isEmpty()) continue;
+        MessageData toolMsg;
+        toolMsg.role       = "tool";
+        toolMsg.toolCallId = entry.id;
+        toolMsg.content    = entry.resolved ? entry.result : reason;
+        currentMessages().append(toolMsg);
+        appended = true;
+    }
+    m_toolCallBatch.clear();
+    if (!appended) return;
+
+    if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+    m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+    saveSessions();
+    emit messagesChanged();
 }
 
 // -----------------------------------------------------------------------
@@ -1317,10 +1661,24 @@ QString responseOutputReasoning(const QJsonArray& output) {
     for (const QJsonValue& itemValue : output) {
         const QJsonObject item = itemValue.toObject();
         if (item["type"].toString() != "reasoning") continue;
+
+        // summary[] 为摘要，content[] 为原始思维链
+        QString summary;
         for (const QJsonValue& summaryValue : item["summary"].toArray()) {
-            const QJsonObject summary = summaryValue.toObject();
-            if (summary["type"].toString() == "summary_text") reasoning += summary["text"].toString();
+            const QJsonObject summaryObject = summaryValue.toObject();
+            if (summaryObject["type"].toString() == "summary_text") summary += summaryObject["text"].toString();
         }
+
+        QString content;
+        for (const QJsonValue& contentValue : item["content"].toArray()) {
+            const QJsonObject contentObject = contentValue.toObject();
+            const QString     contentType   = contentObject["type"].toString();
+            if (contentType == "reasoning_text" || contentType == "text" || contentType == "summary_text")
+                content += contentObject["text"].toString();
+        }
+
+        // 两者都有时优先原始思维链
+        reasoning += content.isEmpty() ? summary : content;
     }
     return reasoning;
 }
@@ -1369,6 +1727,32 @@ QVector<MessagePart> ChatBot::persistGeneratedImages(const QJsonArray& output) {
     return parts;
 }
 
+// 视觉代理路径专用：原图落盘成会话附件供本地查看。落盘规则与 finishMediaMessage 一致
+// （同目录、sha256 命名，幂等）。验证：sessions.json 该条 user 消息 parts 有 localPath、url 空、无 data:image。
+QVector<MessagePart> ChatBot::persistUserImages(const QVector<MessagePart>& parts, const QString& sessionId) {
+    QVector<MessagePart> persisted;
+    if (parts.isEmpty()) return persisted;
+
+    const QString attachmentRoot = QFileInfo(sessionsFilePath()).absolutePath();
+    for (const auto& source : parts) {
+        if (source.type != "image_url") continue;
+
+        MessagePart part = source;
+        if (part.url.startsWith("data:", Qt::CaseInsensitive)) {
+            QString attachmentError;
+            if (!AttachmentManager::persistImage(attachmentRoot, sessionId, part, &attachmentError)) {
+                warn("保存图片附件失败: {}", attachmentError.toStdString());
+                continue;
+            }
+            part.url.clear();
+        }
+        // HTTP 图片没有本地路径，查看器只认本地文件（ImageManager::openAbsolute），给了也必然失败。
+        if (part.localPath.isEmpty()) continue;
+        persisted.append(part);
+    }
+    return persisted;
+}
+
 QVariantList ChatBot::attachmentVariants(const QVector<MessagePart>& parts) const {
     QVariantList variants;
     for (const auto& part : parts) {
@@ -1407,40 +1791,265 @@ struct EmbeddedContent {
     QString reasoning;
 };
 
-EmbeddedContent splitEmbeddedContent(const QString& content) {
+struct ThinkTag {
+    const char* open;
+    const char* close;
+};
+
+const ThinkTag kThinkTags[] = {
+    {"<thinking>",             "</thinking>"            },
+    {"<think>",                "</think>"               },
+    {"<reasoning>",            "</reasoning>"           },
+    {"<reasoning_scratchpad>", "</reasoning_scratchpad>"},
+    {"<thought>",              "</thought>"             },
+    {"<analysis>",             "</analysis>"            },
+};
+
+struct ThinkAlias {
+    const char* from;
+    const char* to;
+};
+
+const ThinkAlias kThinkAliases[] = {
+    {"<|thinking|>",                   "<thinking>" },
+    {"<|/thinking|>",                  "</thinking>"},
+    {"<|think|>",                      "<think>"    },
+    {"<|/think|>",                     "</think>"   },
+    {"<think >",                       "<think>"    },
+    {"<thinking >",                    "<thinking>" },
+    {"\xe2\x97\x81think\xe2\x96\xb7",  "<think>"    },
+    {"\xe2\x97\x81/think\xe2\x96\xb7", "</think>"   },
+    {"\xef\xbd\x9cthink\xef\xbd\x9c",  "<think>"    },
+    {"\xef\xbd\x9c/think\xef\xbd\x9c", "</think>"   },
+};
+
+QString normalizeThinkTags(const QString& text) {
+    if (!text.contains(QLatin1Char('<')) && !text.contains(QChar(0x25C1)) && !text.contains(QChar(0xFF5C))) return text;
+
+    QString normalized = text;
+    for (const auto& alias : kThinkAliases) {
+        const QString from = QString::fromUtf8(alias.from);
+        if (!normalized.contains(from, Qt::CaseInsensitive)) continue;
+        normalized.replace(from, QString::fromUtf8(alias.to), Qt::CaseInsensitive);
+    }
+    return normalized;
+}
+
+// 尾部保留字符数，不小于最长标签长度
+constexpr int kTagRetainChars = 32;
+static_assert(
+    kTagRetainChars >= 24,
+    "kTagRetainChars must stay >= the longest think tag/alias, otherwise tag text leaks into the answer"
+);
+
+struct TagMatch {
+    int pos    = -1;
+    int length = 0;
+};
+
+TagMatch findEarliestThinkTag(const QString& buffer, bool closing) {
+    TagMatch best;
+    for (const auto& tag : kThinkTags) {
+        const QString needle = QString::fromLatin1(closing ? tag.close : tag.open);
+        const int     pos    = buffer.indexOf(needle, 0, Qt::CaseInsensitive);
+        if (pos < 0) continue;
+        // 同一位置取更长的标签
+        if (best.pos < 0 || pos < best.pos || (pos == best.pos && needle.size() > best.length)) {
+            best.pos    = pos;
+            best.length = needle.size();
+        }
+    }
+    return best;
+}
+
+int retainForPossibleTag(const QString& buffer) {
+    const int keep = qMin(buffer.size(), kTagRetainChars);
+    if (keep <= 0) return 0;
+    const QString tail = buffer.right(keep);
+    if (!tail.contains(QLatin1Char('<')) && !tail.contains(QChar(0x25C1)) && !tail.contains(QChar(0xFF5C))) return 0;
+    return keep;
+}
+
+bool couldExtendThinkTag(const QString& tag) {
+    if (tag.isEmpty()) return false;
+    const QString stem = tag.left(tag.size() - 1);
+    for (const auto& candidate : kThinkTags) {
+        const QString open = QString::fromLatin1(candidate.open);
+        if (open.size() > tag.size() && open.startsWith(stem, Qt::CaseInsensitive)) return true;
+    }
+    return false;
+}
+
+bool isTruncatedThinkTag(const QString& text) {
+    if (text.isEmpty()) return false;
+    for (const auto& tag : kThinkTags) {
+        const QString open = QString::fromLatin1(tag.open);
+        if (text.size() < open.size() && open.startsWith(text, Qt::CaseInsensitive)) return true;
+    }
+    return false;
+}
+
+// 从各兼容字段中提取思维链文本
+QString extractReasoningField(const QJsonObject& obj) {
+    static const char* kStringKeys[] = {
+        "reasoning_content",
+        "reasoning",
+        "reasoning_text",
+        "thinking",
+        "analysis",
+        "thought",
+    };
+    for (const char* key : kStringKeys) {
+        const QJsonValue value = obj.value(QLatin1String(key));
+        if (!value.isString()) continue;
+        const QString text = value.toString();
+        if (!text.isEmpty()) return text;
+    }
+
+    // reasoning 为对象时取其中的 text/content
+    for (const char* key : {"reasoning", "thinking"}) {
+        const QJsonValue value = obj.value(QLatin1String(key));
+        if (!value.isObject()) continue;
+        const QJsonObject nested = value.toObject();
+        for (const char* textKey : {"text", "content", "summary", "thinking"}) {
+            const QJsonValue textValue = nested.value(QLatin1String(textKey));
+            if (textValue.isString() && !textValue.toString().isEmpty()) return textValue.toString();
+        }
+    }
+
+    // reasoning_details 数组，取其中的 text
+    const QJsonValue details = obj.value(QLatin1String("reasoning_details"));
+    if (details.isArray()) {
+        QString text;
+        for (const QJsonValue& itemValue : details.toArray()) {
+            const QJsonObject item = itemValue.toObject();
+            const QString     type = item.value(QLatin1String("type")).toString();
+            if (type.startsWith("reasoning") || type.isEmpty()) text += item.value(QLatin1String("text")).toString();
+        }
+        if (!text.isEmpty()) return text;
+    }
+
+    return QString();
+}
+
+EmbeddedContent splitEmbeddedContent(const QString& rawContent) {
     EmbeddedContent result;
-    result.answer = content;
+    const QString   content = normalizeThinkTags(rawContent);
+    result.answer           = content;
 
-    int       open      = content.indexOf("<think>", 0, Qt::CaseInsensitive);
-    int       tagLength = 7;
-    const int longOpen  = content.indexOf("<thinking>", 0, Qt::CaseInsensitive);
-    if (longOpen >= 0 && (open < 0 || longOpen < open)) {
-        open      = longOpen;
-        tagLength = 10;
-    }
-    if (open < 0) return result;
-
-    int       close       = content.indexOf("</think>", open + tagLength, Qt::CaseInsensitive);
-    int       closeLength = 8;
-    const int longClose   = content.indexOf("</thinking>", open + tagLength, Qt::CaseInsensitive);
-    if (longClose >= 0 && (close < 0 || longClose < close)) {
-        close       = longClose;
-        closeLength = 11;
+    const TagMatch open = findEarliestThinkTag(content, false);
+    if (open.pos < 0) {
+        // 只有结束标签时，之前的整段都算思维链
+        const TagMatch strayClose = findEarliestThinkTag(content, true);
+        if (strayClose.pos >= 0) {
+            result.reasoning = content.left(strayClose.pos);
+            result.answer    = content.mid(strayClose.pos + strayClose.length);
+        }
+        return result;
     }
 
-    const int reasoningStart  = open + tagLength;
-    const int reasoningLength = close < 0 ? -1 : close - reasoningStart;
-    result.reasoning          = content.mid(reasoningStart, reasoningLength);
-    result.answer             = content.left(open);
-    if (close >= 0) result.answer += content.mid(close + closeLength);
+    const TagMatch close          = findEarliestThinkTag(content.mid(open.pos + open.length), true);
+    const int      reasoningStart = open.pos + open.length;
+    if (close.pos < 0) {
+        // 没有结束标签：整段都算思维链
+        result.reasoning = content.mid(reasoningStart);
+        result.answer    = content.left(open.pos);
+        return result;
+    }
+
+    const int closePos = reasoningStart + close.pos;
+    result.reasoning   = content.mid(reasoningStart, closePos - reasoningStart);
+    result.answer      = content.left(open.pos) + content.mid(closePos + close.length);
     return result;
+}
+
+// 补齐缺失的 tool 结果，丢弃孤立的 tool 消息
+void normalizeToolMessageSequence(QJsonArray& messages) {
+    QJsonArray normalized;
+    for (int index = 0; index < messages.size(); ++index) {
+        const QJsonObject message = messages.at(index).toObject();
+        const QString     role    = message.value(QLatin1String("role")).toString();
+
+        // tool 消息统一在下面重建
+        if (role == QLatin1String("tool")) continue;
+
+        normalized.append(message);
+
+        if (role != QLatin1String("assistant")) continue;
+        const QJsonValue toolCallsValue = message.value(QLatin1String("tool_calls"));
+        if (!toolCallsValue.isArray()) continue;
+
+        QStringList   pendingIds;
+        QSet<QString> seenIds;
+        QJsonArray    validCalls;
+        for (const QJsonValue& callValue : toolCallsValue.toArray()) {
+            const QJsonObject call = callValue.toObject();
+            const QString     id   = call.value(QLatin1String("id")).toString().trimmed();
+            if (id.isEmpty() || seenIds.contains(id)) continue;
+            seenIds.insert(id);
+            validCalls.append(call);
+            pendingIds.append(id);
+        }
+
+        if (validCalls.isEmpty()) {
+            // 无有效 tool_calls 时去掉该字段
+            QJsonObject cleaned = normalized.last().toObject();
+            cleaned.remove(QLatin1String("tool_calls"));
+            normalized.replace(normalized.size() - 1, cleaned);
+            continue;
+        }
+        if (validCalls.size() != toolCallsValue.toArray().size()) {
+            QJsonObject cleaned   = normalized.last().toObject();
+            cleaned["tool_calls"] = validCalls;
+            normalized.replace(normalized.size() - 1, cleaned);
+        }
+
+        QHash<QString, QString> results;
+        while (index + 1 < messages.size()) {
+            const QJsonObject next = messages.at(index + 1).toObject();
+            if (next.value(QLatin1String("role")).toString() != QLatin1String("tool")) break;
+            ++index;
+            const QString id = next.value(QLatin1String("tool_call_id")).toString();
+            if (id.isEmpty() || results.contains(id)) continue;
+            results.insert(id, next.value(QLatin1String("content")).toString());
+        }
+
+        for (const QString& id : pendingIds) {
+            QJsonObject toolMessage;
+            toolMessage["role"]         = QStringLiteral("tool");
+            toolMessage["tool_call_id"] = id;
+            toolMessage["content"]      = results.contains(id) ? results.value(id) : pendingToolResultText();
+            normalized.append(toolMessage);
+        }
+    }
+    messages = normalized;
 }
 
 } // namespace
 
 void ChatBot::finishStream() {
     if (m_streamEndEmitted) return;
+    // Client tools continue after this response; only unfinished server tools end here.
+    const auto states = m_responseToolStates;
+    for (const auto& value : states) {
+        auto state = value.toMap();
+        if (state.value("server").toBool() && state.value("state").toString() == "running") {
+            state["state"] = "error";
+            state["text"] = "服务器工具执行未完成";
+            publishTool(state);
+        }
+    }
     flushEmbeddedContent();
+    // A stream ending with incomplete client arguments must not leave a card
+    // indefinitely preparing. Dispatched tools are pending/running by this point.
+    const auto remaining = m_responseToolStates;
+    for (const auto& value : remaining) {
+        auto state = value.toMap();
+        if (state.value("state").toString() != "preparing") continue;
+        state["state"] = "error";
+        state["text"] = "工具调用未完成，本次没有执行";
+        publishTool(state);
+    }
     m_streamEndEmitted = true;
     emit streamEnd();
 }
@@ -1448,79 +2057,102 @@ void ChatBot::finishStream() {
 void ChatBot::emitContentChunk(const QString& content) {
     if (content.isEmpty()) return;
 
-    // Some OpenAI-compatible providers expose reasoning inside content instead
-    // of reasoning_content. Keep that protocol quirk out of the QML state model.
+    // Some providers embed reasoning inside content.
     m_embeddedContentBuffer += content;
     while (!m_embeddedContentBuffer.isEmpty()) {
+        m_embeddedContentBuffer = normalizeThinkTags(m_embeddedContentBuffer);
+
         if (m_embeddedReasoningActive) {
-            int       close       = m_embeddedContentBuffer.indexOf("</think>", 0, Qt::CaseInsensitive);
-            int       closeLength = 8;
-            const int longClose   = m_embeddedContentBuffer.indexOf("</thinking>", 0, Qt::CaseInsensitive);
-            if (longClose >= 0 && (close < 0 || longClose < close)) {
-                close       = longClose;
-                closeLength = 11;
-            }
-            if (close < 0) {
-                const int keep     = qMin(m_embeddedContentBuffer.size(), 10);
+            const TagMatch close = findEarliestThinkTag(m_embeddedContentBuffer, true);
+            if (close.pos < 0) {
+                // 尾部可能是半个标签，留给下一个分片
+                const int keep     = retainForPossibleTag(m_embeddedContentBuffer);
                 const int emitSize = m_embeddedContentBuffer.size() - keep;
-                if (emitSize > 0) {
-                    const QString reasoning = m_embeddedContentBuffer.left(emitSize);
-                    m_embeddedContentBuffer.remove(0, emitSize);
-                    m_currentReasoningBuffer += reasoning;
-                    emit reasoningChunk(reasoning);
-                }
+                if (emitSize <= 0) return;
+                const QString reasoning = m_embeddedContentBuffer.left(emitSize);
+                m_embeddedContentBuffer.remove(0, emitSize);
+                appendReasoningChunk(reasoning);
                 return;
             }
-            const QString reasoning = m_embeddedContentBuffer.left(close);
-            if (!reasoning.isEmpty()) {
-                m_currentReasoningBuffer += reasoning;
-                emit reasoningChunk(reasoning);
-            }
-            m_embeddedContentBuffer.remove(0, close + closeLength);
+            if (close.pos > 0) appendReasoningChunk(m_embeddedContentBuffer.left(close.pos));
+            m_embeddedContentBuffer.remove(0, close.pos + close.length);
             m_embeddedReasoningActive = false;
             continue;
         }
 
-        int open = m_embeddedContentBuffer.indexOf("<think>", 0, Qt::CaseInsensitive);
-        if (open < 0) open = m_embeddedContentBuffer.indexOf("<thinking>", 0, Qt::CaseInsensitive);
-        if (open < 0) {
-            // Retain a possible partial opening tag for the next network chunk.
-            const int keep     = qMin(m_embeddedContentBuffer.size(), 10);
+        const TagMatch open = findEarliestThinkTag(m_embeddedContentBuffer, false);
+        if (open.pos < 0) {
+            // Retain a possible partial tag for the next chunk.
+            const int keep     = retainForPossibleTag(m_embeddedContentBuffer);
             const int emitSize = m_embeddedContentBuffer.size() - keep;
-            if (emitSize > 0) {
-                const QString answer = m_embeddedContentBuffer.left(emitSize);
-                m_embeddedContentBuffer.remove(0, emitSize);
-                m_currentStreamBuffer += answer;
-                emit streamChunk(answer);
-            }
+            if (emitSize <= 0) return;
+            const QString answer = m_embeddedContentBuffer.left(emitSize);
+            m_embeddedContentBuffer.remove(0, emitSize);
+            appendAnswerChunk(answer);
             return;
         }
 
-        if (open > 0) {
-            const QString answer = m_embeddedContentBuffer.left(open);
-            m_embeddedContentBuffer.remove(0, open);
-            m_currentStreamBuffer += answer;
-            emit streamChunk(answer);
-            continue;
+        if (open.pos > 0) {
+            appendAnswerChunk(m_embeddedContentBuffer.left(open.pos));
+            m_embeddedContentBuffer.remove(0, open.pos);
         }
 
-        const bool longTag = m_embeddedContentBuffer.startsWith("<thinking>", Qt::CaseInsensitive);
-        m_embeddedContentBuffer.remove(0, longTag ? 10 : 7);
+        // 可能是更长标签的前缀，先等下一个分片
+        const QString candidate = m_embeddedContentBuffer.left(open.length);
+        if (candidate.size() == m_embeddedContentBuffer.size() && couldExtendThinkTag(candidate)) return;
+
+        m_embeddedContentBuffer.remove(0, open.length);
         m_embeddedReasoningActive = true;
     }
 }
 
+void ChatBot::appendReasoningChunk(const QString& text) {
+    if (text.isEmpty()) return;
+    m_currentReasoningBuffer += text;
+    emit reasoningChunk(text);
+}
+
+void ChatBot::appendAnswerChunk(const QString& text) {
+    if (text.isEmpty()) return;
+    m_currentStreamBuffer += text;
+    emit streamChunk(text);
+}
+
+// 用完整正文重新拆分思维链与正文
+void ChatBot::reclassifyFinalAnswer() {
+    if (m_currentStreamBuffer.isEmpty()) return;
+    // 已有独立思维链字段时不再归并
+    if (!m_currentReasoningBuffer.isEmpty()) return;
+
+    const EmbeddedContent finalSplit = splitEmbeddedContent(m_currentStreamBuffer);
+    if (finalSplit.reasoning.isEmpty()) return;
+
+    info("收尾时从正文中拆出 {} 字的思维链", finalSplit.reasoning.size());
+    m_currentReasoningBuffer = finalSplit.reasoning;
+    m_currentStreamBuffer    = finalSplit.answer;
+}
+
 void ChatBot::flushEmbeddedContent() {
     if (m_embeddedContentBuffer.isEmpty()) return;
-    const QString remaining = m_embeddedContentBuffer;
+    QString remaining = normalizeThinkTags(m_embeddedContentBuffer);
     m_embeddedContentBuffer.clear();
-    if (m_embeddedReasoningActive) {
-        m_currentReasoningBuffer += remaining;
-        emit reasoningChunk(remaining);
-    } else {
-        m_currentStreamBuffer += remaining;
-        emit streamChunk(remaining);
+
+    // 流停在完整开标签后时按思维链收尾
+    if (!m_embeddedReasoningActive) {
+        const TagMatch open = findEarliestThinkTag(remaining, false);
+        if (open.pos >= 0 && remaining.size() == open.pos + open.length) {
+            if (open.pos > 0) appendAnswerChunk(remaining.left(open.pos));
+            remaining.clear();
+            m_embeddedReasoningActive = true;
+        }
     }
+
+    if (m_embeddedReasoningActive) {
+        appendReasoningChunk(remaining);
+        return;
+    }
+    if (isTruncatedThinkTag(remaining)) return;
+    appendAnswerChunk(remaining);
 }
 
 void ChatBot::makeApiRequest(const QJsonArray& messages) {
@@ -1531,16 +2163,24 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
 
     m_cancelled        = false;
     m_streamEndEmitted = false;
+    m_responseMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    m_responseSessionId = m_currentSessionId;
+    m_responseToolStates.clear();
+    m_toolFlushScheduled = false;
 
     if (m_apiKey.isEmpty()) {
         emit errorOccurred("API 密钥未设置\n请进入「设置」页面配置有效的 API 密钥后重试");
         return;
     }
 
+    // 发送前统一规整 tool_calls 序列
+    QJsonArray safeMessages = messages;
+    normalizeToolMessageSequence(safeMessages);
+
     QJsonObject requestBody;
     requestBody["model"] = m_model;
     requestBody[usesResponsesApi() ? "input" : "messages"] =
-        usesResponsesApi() ? messagesToResponsesInput(messages) : messages;
+        usesResponsesApi() ? messagesToResponsesInput(safeMessages) : safeMessages;
     requestBody["temperature"] = m_temperature;
     requestBody["stream"]      = m_isStreaming;
     if (m_isStreaming && !usesResponsesApi())
@@ -1570,7 +2210,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     }
 
     // 注入本地函数工具和 Responses API 图片生成工具。
-    if ((m_capToolCall && ((m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) || m_shellToolEnabled))
+    if (searchToolAvailable() || (m_capToolCall && m_shellToolEnabled)
         || (usesResponsesApi() && (m_capImageGeneration || m_nativeWebSearchEnabled))) {
         injectToolDefinitions(requestBody);
     }
@@ -1580,7 +2220,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     debug(
         "发送 API 请求: model={}, messages={}, payload={} bytes",
         m_model.toStdString(),
-        messages.size(),
+        safeMessages.size(),
         requestData.size()
     );
 
@@ -1604,7 +2244,10 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     m_serverToolCallActive = false;
     m_serverToolCallName.clear();
 
-    if (m_isStreaming) emit streamStart();
+    // 流式与非流式都要发 streamStart：QML 用它复位 streamThrottle（endProcessed 等），
+    // 否则一次流式回复之后再发非流式请求时 messageReceived 会被 endProcessed 挡住，
+    // 回复不显示。注意非流式路径不发 streamEnd，只有 finishStream() 会发。
+    emit streamStart();
 
     connect(reply, &QNetworkReply::finished, this, [this, reply, seq]() {
         if (seq != m_requestSeq) {
@@ -1648,8 +2291,10 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                 if (!trimmedLine.startsWith("data: ")) continue;
 
                 QString jsonData = trimmedLine.mid(6);
+                if (m_streamEndEmitted) continue;
                 if (jsonData.trimmed() == "[DONE]") {
                     flushEmbeddedContent();
+                    if (!m_cancelled) reclassifyFinalAnswer();
                     if (m_serverToolCallActive) {
                         emit toolCallProgress(
                             QString("已完成：%1")
@@ -1659,8 +2304,6 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                         m_serverToolCallActive = false;
                         m_serverToolCallName.clear();
                     }
-                    // 在 finished 信号之前就把响应写入历史，
-                    // 防止 regenerateMessage 在 streamEnd 后 finished 前被调用时因索引越界空转
                     if (!m_cancelled) {
                         if (!m_toolCallsBuffer.isEmpty()) {
                             json tcArr = json::array();
@@ -1672,6 +2315,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             assistantMsg.content       = m_currentStreamBuffer;
                             assistantMsg.reasoning     = m_currentReasoningBuffer;
                             assistantMsg.toolCallsJson = toolCallsJson;
+                            attachResponseMetadata(assistantMsg);
                             currentMessages().append(assistantMsg);
                             if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                             m_sessions[m_currentSessionId].updatedAt =
@@ -1679,11 +2323,12 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             saveSessions();
                             emit messagesChanged();
                             dispatchToolCalls(toolCallsJson);
-                        } else if (!m_currentStreamBuffer.isEmpty() || !m_currentReasoningBuffer.isEmpty()) {
+                        } else if (!m_currentStreamBuffer.isEmpty() || !m_currentReasoningBuffer.isEmpty() || !m_responseToolStates.isEmpty()) {
                             MessageData assistantMsg;
                             assistantMsg.role      = "assistant";
                             assistantMsg.content   = m_currentStreamBuffer;
                             assistantMsg.reasoning = m_currentReasoningBuffer;
+                            attachResponseMetadata(assistantMsg);
                             currentMessages().append(assistantMsg);
                             if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                             m_sessions[m_currentSessionId].updatedAt =
@@ -1692,7 +2337,6 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             emit messagesChanged();
                         }
                     }
-                    // 清空 buffer 防止 handleNetworkReply 重复保存
                     m_currentStreamBuffer.clear();
                     m_currentReasoningBuffer.clear();
                     m_toolCallsBuffer.clear();
@@ -1714,12 +2358,18 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                         || eventType == "response.reasoning_text.delta"
                     ) {
                         const QString content = obj["delta"].toString();
-                        if (!content.isEmpty()) {
-                            emit reasoningChunk(content);
-                            m_currentReasoningBuffer += content;
-                        }
+                        if (!content.isEmpty()) appendReasoningChunk(content);
+                    } else if (
+                        eventType == "response.reasoning_summary_text.done"
+                        || eventType == "response.reasoning_text.done"
+                    ) {
+                        // 服务端只推 done 时用最终文本兜底
+                        const QString content = obj["text"].toString();
+                        if (m_currentReasoningBuffer.isEmpty() && !content.isEmpty()) appendReasoningChunk(content);
                     } else if (eventType == "response.function_call_arguments.delta") {
-                        const QString callId  = obj["item_id"].toString(obj["call_id"].toString());
+                        // value() must be read-only: inserting a missing call_id
+                        // with operator[] can invalidate the item_id QJsonValueRef.
+                        const QString callId = obj.value("item_id").toString(obj.value("call_id").toString());
                         const QString content = obj["delta"].toString();
                         if (!callId.isEmpty()) {
                             int index = m_responseToolItemIndexes.value(callId, m_toolCallsBuffer.size());
@@ -1735,14 +2385,13 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             m_toolCallsBuffer[index]["function"]["arguments"] =
                                 m_toolCallsBuffer[index]["function"]["arguments"].get<std::string>()
                                 + content.toStdString();
+                            prepareTool(index, m_toolCallsBuffer[index]);
                         }
                     } else if (eventType == "response.output_item.added") {
                         const QJsonObject item     = obj["item"].toObject();
                         const QString     itemType = item["type"].toString();
                         if (itemType == "function_call") {
-                            // 本地函数工具稍后会由 dispatchToolCalls 按真实 toolCallId 建卡，
-                            // 此处不创建无 ID 的通用进度卡，避免同一次调用显示两项工具。
-                            const int index                                  = m_toolCallsBuffer.size();
+                            const int index = m_responseToolItemIndexes.value(item["id"].toString(), m_toolCallsBuffer.size());
                             m_responseToolItemIndexes[item["id"].toString()] = index;
                             m_toolCallsBuffer[index]                         = json{
                                 {"id",       item["call_id"].toString().toStdString()       },
@@ -1751,20 +2400,38 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                                  {{"name", item["name"].toString().toStdString()},
                                   {"arguments", item["arguments"].toString().toStdString()}}}
                             };
+                            prepareTool(index, m_toolCallsBuffer[index]);
                         } else if (itemType.endsWith("_call")) {
+                            updateServerTool(item, "running");
                             m_serverToolCallActive = true;
                             m_serverToolCallName   = itemType;
                             emit toolCallProgress(QString("正在执行：%1").arg(itemType), false);
                         }
                     } else if (eventType == "response.output_item.done") {
-                        const QString itemType = obj["item"].toObject()["type"].toString();
+                        const auto item = obj["item"].toObject();
+                        const QString itemType = item["type"].toString();
+                        if (itemType == "function_call") {
+                            const int index = m_responseToolItemIndexes.value(item["id"].toString(), -1);
+                            if (index >= 0) {
+                                auto& call = m_toolCallsBuffer[index];
+                                call["id"] = item["call_id"].toString().toStdString();
+                                call["function"]["name"] = item["name"].toString().toStdString();
+                                call["function"]["arguments"] = item["arguments"].toString().toStdString();
+                                prepareTool(index, call);
+                            }
+                        }
                         if (itemType.endsWith("_call") && itemType != "function_call") {
+                            updateServerTool(item, item["status"].toString() == "failed" ? "error" : "done");
                             m_serverToolCallActive = false;
                             m_serverToolCallName.clear();
                             emit toolCallProgress(QString("已完成：%1").arg(itemType), true);
                         }
                     } else if (eventType.startsWith("response.") && eventType.contains("_call.")) {
                         const QString toolName = eventType.section('.', 1, 1);
+                        QJsonObject item{{"id", obj["item_id"]}, {"type", toolName}};
+                        if (eventType.endsWith(".in_progress")) updateServerTool(item, "running");
+                        else if (eventType.endsWith(".completed") || eventType.endsWith(".done")) updateServerTool(item, "done");
+                        else if (eventType.endsWith(".failed")) updateServerTool(item, "error");
                         if (eventType.endsWith(".in_progress")) {
                             m_serverToolCallActive = true;
                             m_serverToolCallName   = toolName;
@@ -1774,6 +2441,13 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             m_serverToolCallName.clear();
                             emit toolCallProgress(QString("已完成：%1").arg(toolName), true);
                         }
+                    } else if (eventType == "response.failed" || eventType == "response.incomplete" || eventType == "error") {
+                        const auto response = obj.value("response").toObject();
+                        const auto error = response.value("error").toObject();
+                        const auto reason = error.value("message").toString(obj.value("message").toString("响应未完成"));
+                        emit errorOccurred("API 请求失败\n" + reason);
+                        m_toolCallsBuffer.clear();
+                        finishStream();
                     } else if (eventType == "response.completed") {
                         const QJsonObject response = obj["response"].toObject();
                         if (!obj["usage"].isObject() && response["usage"].isObject())
@@ -1803,13 +2477,15 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             m_serverToolCallName.clear();
                         }
                         const QJsonArray           output          = response["output"].toArray();
+                        for (const auto& value : output) {
+                            const auto item = value.toObject();
+                            if (item["type"].toString().endsWith("_call") && item["type"].toString() != "function_call")
+                                updateServerTool(item, item["status"].toString() == "failed" ? "error" : "done");
+                        }
                         const QVector<MessagePart> generatedImages = persistGeneratedImages(output);
                         if (m_currentReasoningBuffer.isEmpty()) {
                             const QString reasoning = responseOutputReasoning(output);
-                            if (!reasoning.isEmpty()) {
-                                m_currentReasoningBuffer = reasoning;
-                                emit reasoningChunk(reasoning);
-                            }
+                            if (!reasoning.isEmpty()) appendReasoningChunk(reasoning);
                         }
                         flushEmbeddedContent();
                         if (m_currentStreamBuffer.isEmpty()) {
@@ -1837,6 +2513,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             assistantMsg.reasoning     = m_currentReasoningBuffer;
                             assistantMsg.toolCallsJson = toolCallsJson;
                             assistantMsg.parts         = generatedImages;
+                            attachResponseMetadata(assistantMsg);
                             currentMessages().append(assistantMsg);
                             if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                             m_sessions[m_currentSessionId].updatedAt =
@@ -1845,13 +2522,14 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             emit messagesChanged();
                             dispatchToolCalls(toolCallsJson);
                         } else if (
-                            !m_cancelled && (!m_currentStreamBuffer.isEmpty() || !m_currentReasoningBuffer.isEmpty())
+                            !m_cancelled && (!m_currentStreamBuffer.isEmpty() || !m_currentReasoningBuffer.isEmpty() || !m_responseToolStates.isEmpty())
                         ) {
                             MessageData assistantMsg;
                             assistantMsg.role      = "assistant";
                             assistantMsg.content   = m_currentStreamBuffer;
                             assistantMsg.reasoning = m_currentReasoningBuffer;
                             assistantMsg.parts     = generatedImages;
+                            attachResponseMetadata(assistantMsg);
                             currentMessages().append(assistantMsg);
                             if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                             m_sessions[m_currentSessionId].updatedAt =
@@ -1878,10 +2556,9 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
 
                 QJsonObject delta = choice["delta"].toObject();
 
-                const QString reasoning = delta["reasoning_content"].toString(delta["reasoning"].toString());
+                const QString reasoning = extractReasoningField(delta);
                 if (!reasoning.isEmpty()) {
-                    emit reasoningChunk(reasoning);
-                    m_currentReasoningBuffer += reasoning;
+                    appendReasoningChunk(reasoning);
                 }
 
                 if (delta.contains("content") && delta["content"].isString()) {
@@ -1908,11 +2585,12 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                         if (tc.contains("function") && tc["function"].isObject()) {
                             QJsonObject fn = tc["function"].toObject();
                             if (fn.contains("name") && !fn["name"].toString().isEmpty())
-                                buf["function"]["name"] = fn["name"].toString().toStdString();
+                                buf["function"]["name"] = buf["function"]["name"].get<std::string>() + fn["name"].toString().toStdString();
                             if (fn.contains("arguments"))
                                 buf["function"]["arguments"] = buf["function"]["arguments"].get<std::string>()
                                                              + fn["arguments"].toString().toStdString();
                         }
+                        prepareTool(index, buf);
                     }
                 }
             }
@@ -1925,9 +2603,14 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
 // -----------------------------------------------------------------------
 
 void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
+    if (isStream && m_streamEndEmitted) {
+        reply->deleteLater();
+        return;
+    }
     if (reply->error() == QNetworkReply::NoError) {
         if (isStream) {
             flushEmbeddedContent();
+            if (!m_cancelled) reclassifyFinalAnswer();
             if (!m_toolCallsBuffer.isEmpty()) {
                 json tcArr = json::array();
                 for (auto it = m_toolCallsBuffer.constBegin(); it != m_toolCallsBuffer.constEnd(); ++it)
@@ -1941,6 +2624,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 }
                 assistantMsg.toolCallsJson = toolCallsJson;
                 if (!m_cancelled) {
+                    attachResponseMetadata(assistantMsg);
                     currentMessages().append(assistantMsg);
                     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
@@ -1948,12 +2632,13 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     emit messagesChanged();
                 }
                 dispatchToolCalls(toolCallsJson);
-            } else if (!m_currentStreamBuffer.isEmpty() || !m_currentReasoningBuffer.isEmpty()) {
+            } else if (!m_currentStreamBuffer.isEmpty() || !m_currentReasoningBuffer.isEmpty() || !m_responseToolStates.isEmpty()) {
                 if (!m_cancelled) {
                     MessageData assistantMsg;
                     assistantMsg.role      = "assistant";
                     assistantMsg.content   = m_currentStreamBuffer;
                     assistantMsg.reasoning = m_currentReasoningBuffer;
+                    attachResponseMetadata(assistantMsg);
                     currentMessages().append(assistantMsg);
                     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
@@ -1989,6 +2674,11 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     return;
                 }
                 const QJsonArray           output          = obj["output"].toArray();
+                for (const auto& value : output) {
+                    const auto item = value.toObject();
+                    if (item["type"].toString().endsWith("_call") && item["type"].toString() != "function_call")
+                        updateServerTool(item, item["status"].toString() == "failed" ? "error" : "done");
+                }
                 const QVector<MessagePart> generatedImages = persistGeneratedImages(output);
                 const QString              toolCallsJson   = responseOutputToolCalls(output);
                 QString                    content         = responseOutputText(output);
@@ -2008,18 +2698,20 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     assistantMsg.reasoning     = reasoning;
                     assistantMsg.toolCallsJson = toolCallsJson;
                     assistantMsg.parts         = generatedImages;
+                    attachResponseMetadata(assistantMsg);
                     currentMessages().append(assistantMsg);
                     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
                     saveSessions();
                     emit messagesChanged();
                     dispatchToolCalls(toolCallsJson);
-                } else if (!m_cancelled && (!content.isEmpty() || !reasoning.isEmpty())) {
+                } else if (!m_cancelled && (!content.isEmpty() || !reasoning.isEmpty() || !m_responseToolStates.isEmpty())) {
                     MessageData assistantMsg;
                     assistantMsg.role      = "assistant";
                     assistantMsg.content   = content;
                     assistantMsg.reasoning = reasoning;
                     assistantMsg.parts     = generatedImages;
+                    attachResponseMetadata(assistantMsg);
                     currentMessages().append(assistantMsg);
                     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
@@ -2049,7 +2741,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
 
             QJsonObject           choice    = choices.first().toObject();
             QJsonObject           message   = choice["message"].toObject();
-            QString               reasoning = message["reasoning_content"].toString(message["reasoning"].toString());
+            QString               reasoning = extractReasoningField(message);
             const EmbeddedContent embedded  = splitEmbeddedContent(message["content"].toString());
             if (!embedded.reasoning.isEmpty()) {
                 if (!reasoning.isEmpty()) reasoning += "\n";
@@ -2068,6 +2760,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 }
                 assistantMsg.toolCallsJson = toolCallsJson;
                 if (!m_cancelled) {
+                    attachResponseMetadata(assistantMsg);
                     currentMessages().append(assistantMsg);
                     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
@@ -2082,6 +2775,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     assistantMsg.role      = "assistant";
                     assistantMsg.content   = content;
                     assistantMsg.reasoning = reasoning;
+                    attachResponseMetadata(assistantMsg);
                     currentMessages().append(assistantMsg);
                     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
@@ -2140,6 +2834,13 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
 // -----------------------------------------------------------------------
 
 void ChatBot::editMessage(int index, const QString& newContent) {
+    // 转调带媒体的版本；传空数组时图片仍会被移除，与本接口原有语义一致。
+    editMessageWithMedia(index, newContent, QStringLiteral("[]"));
+}
+
+// 带媒体的编辑：只按编辑后的图片集合重建图片，文件/音频 part 原样保留（编辑界面只回填图片，
+// 整体清空会把附件永久删掉）。验证：sessions.json 里该条 user 消息仍有 localPath、不含 data:image。
+void ChatBot::editMessageWithMedia(int index, const QString& newContent, const QString& mediaParts) {
     auto& msgs = currentMessages();
     if (index < 0 || index >= msgs.size()) return;
 
@@ -2148,24 +2849,101 @@ void ChatBot::editMessage(int index, const QString& newContent) {
         return;
     }
 
-    QString currentRole = msgs[index].role;
-    msgs[index].content = newContent;
-    msgs[index].parts.clear();
+    static constexpr int MAX_MEDIA_JSON_SIZE = 12 * 1024 * 1024;
+    if (mediaParts.size() > MAX_MEDIA_JSON_SIZE) {
+        emit errorOccurred("图片数据过大，请裁剪或减少拼接范围后重试");
+        return;
+    }
+
+    // user 消息的 parts 形如 [text(用户正文), text(附件内容上下文), file/input_audio…, image…]：
+    // 只换用户正文那一条，其余必须留着，否则"改几个字"会把附件内容从模型视野里删掉。
+    QVector<MessagePart> parts;
+    bool                 droppedUserText = false;
+    for (const auto& part : msgs[index].parts) {
+        if (part.type == "image_url") continue; // 图片由编辑界面传来的集合决定
+        if (part.type == "text" && !droppedUserText && part.text == msgs[index].content) {
+            droppedUserText = true;
+            continue;
+        }
+        parts.append(part);
+    }
+
+    QJsonDocument doc = QJsonDocument::fromJson(mediaParts.toUtf8());
+    if (doc.isArray()) {
+        for (const auto& val : doc.array()) {
+            const QJsonObject obj = val.toObject();
+            if (obj["type"].toString() != "image_url") continue;
+
+            MessagePart part;
+            part.type      = "image_url";
+            part.url       = obj["url"].toString();
+            part.localPath = obj["localPath"].toString();
+            part.name      = obj["name"].toString();
+            part.mimeType  = obj["mimeType"].toString();
+            // url 与 localPath 都空 = 图已不可用（文件被删/格式不支持），丢弃而不是发空图。
+            if (part.url.isEmpty() && part.localPath.isEmpty()) continue;
+            parts.append(part);
+        }
+    }
+
+    const bool hadImage =
+        std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) { return part.type == "image_url"; });
+    // 兜底校验（QML 侧已保证"文字和图片至少留一个"）：不能用 parts.isEmpty() 判断 —— 保留的
+    // file 部分会让 parts 非空，文字为空时仍会发出 content 为空的消息。
+    if (newContent.trimmed().isEmpty() && !hadImage) {
+        emit errorOccurred("没有可发送的文字或媒体内容");
+        return;
+    }
+
+    // 内嵌 base64 不落库（messageDataToJson 跳过 data: 图片），所以落盘后必须清掉 url。
+    QVector<MessagePart> historyParts   = parts;
+    const QString        attachmentRoot = QFileInfo(sessionsFilePath()).absolutePath();
+    for (auto& part : historyParts) {
+        if (part.type != "image_url" || !part.url.startsWith("data:", Qt::CaseInsensitive)) continue;
+        QString attachmentError;
+        if (!AttachmentManager::persistImage(attachmentRoot, m_currentSessionId, part, &attachmentError)) {
+            warn("保存图片附件失败: {}", attachmentError.toStdString());
+            part.localPath.clear();
+        }
+        part.url.clear();
+    }
+    historyParts.erase(
+        std::remove_if(
+            historyParts.begin(),
+            historyParts.end(),
+            [](const MessagePart& part) {
+                return part.type == "image_url" && part.url.isEmpty() && part.localPath.isEmpty();
+            }
+        ),
+        historyParts.end()
+    );
+
+    auto& target = msgs[index];
+    // 文字为空但图片还在：落库成 "[图片]"，与 finishMediaMessage 的取值保持一致。
+    target.content = newContent.isEmpty() && hadImage ? QStringLiteral("[图片]") : newContent;
+    target.parts   = historyParts;
+    if (!newContent.isEmpty() && !target.parts.isEmpty()) {
+        MessagePart textPart;
+        textPart.type = "text";
+        textPart.text = newContent;
+        target.parts.prepend(textPart);
+    }
     msgs.resize(index + 1);
 
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit messagesChanged();
 
-    if (currentRole == "user" && index == msgs.size() - 1) {
-        QJsonArray  apiMessages;
-        QJsonObject sysMsg;
-        sysMsg["role"]    = "system";
-        sysMsg["content"] = m_defaultPrompt;
-        apiMessages.append(sysMsg);
-        for (const auto& msg : msgs) apiMessages.append(messageToJson(msg));
-        makeApiRequest(apiMessages);
-    }
+    // 只在编辑用户消息时重新请求（不依赖上面那条校验；历史最后一条是 assistant 时接口会报错）。
+    if (msgs[index].role != "user") return;
+
+    QJsonArray  apiMessages;
+    QJsonObject sysMsg;
+    sysMsg["role"]    = "system";
+    sysMsg["content"] = m_defaultPrompt;
+    apiMessages.append(sysMsg);
+    for (const auto& msg : msgs) apiMessages.append(messageToJson(msg));
+    makeApiRequest(apiMessages);
 }
 
 void ChatBot::truncateHistory(int index) {
@@ -2225,20 +3003,18 @@ void ChatBot::regenerateMessage(int index) {
 // -----------------------------------------------------------------------
 
 void ChatBot::clearHistory() {
-    ++m_requestSeq;
-    abortActiveReplies();
+    cancelRequest();
 
     currentMessages().clear();
+    m_responseToolStates.clear();
+    m_responseMessageId.clear();
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit messagesChanged();
 }
 
-void ChatBot::cancelRequest() {
-    m_cancelled = true;
-    ++m_requestSeq;
-    abortActiveReplies();
-
+// 中止 shell 调用，只发信号不写历史
+void ChatBot::abortPendingShellExecs(const QString& reason) {
     QStringList shellKeys;
     for (auto it = m_activeShellExecs.constBegin(); it != m_activeShellExecs.constEnd(); ++it)
         shellKeys.append(it.key());
@@ -2246,9 +3022,19 @@ void ChatBot::cancelRequest() {
 
     while (!m_pendingShellExecs.isEmpty()) {
         auto pending = m_pendingShellExecs.takeFirst();
-        emit shellCommandFinished(pending.toolCallId, false, "用户取消了请求", pending.command);
+        emit shellCommandFinished(pending.toolCallId, false, reason, pending.command);
     }
+}
 
+void ChatBot::cancelRequest() {
+    m_cancelled = true;
+    ++m_requestSeq;
+    abortActiveReplies();
+    finishOutstandingTools("cancelled", "已取消");
+    abortPendingShellExecs("用户取消了请求");
+    m_toolFlushScheduled = false;
+
+    persistPartialResponse();
     m_currentStreamBuffer.clear();
     m_currentReasoningBuffer.clear();
     m_embeddedContentBuffer.clear();
@@ -2258,7 +3044,10 @@ void ChatBot::cancelRequest() {
     m_responseToolItemIndexes.clear();
     m_serverToolCallActive = false;
     m_serverToolCallName.clear();
-    m_toolCallBatch.clear();
+    saveSessions();
+
+    // 补齐本轮未完成的工具调用结果
+    resolvePendingToolCalls("本次请求已中断，该工具调用已取消。");
 
     emit requestCancelled();
 }
@@ -2303,6 +3092,8 @@ QVariantList ChatBot::getMessages() const {
 
     for (const auto& msg : m_sessions[m_currentSessionId].messages) {
         QVariantMap m;
+        m["messageId"]     = msg.messageId;
+        m["toolStates"]    = msg.toolStates;
         m["role"]          = msg.role;
         m["content"]       = msg.content;
         m["toolCallsJson"] = msg.toolCallsJson;
@@ -2385,7 +3176,9 @@ void ChatBot::setIsStreaming(bool streaming) {
     auto& config  = mod::Config::getInstance();
     json  aiCfg   = config.read("ai");
     if (aiCfg.is_null()) aiCfg = json::object();
-    if (!aiCfg.contains("chatbot")) aiCfg["chatbot"] = json::object();
+    // 顶层与 chatbot 下都写一份
+    aiCfg["streaming"] = streaming;
+    if (!aiCfg.contains("chatbot") || !aiCfg["chatbot"].is_object()) aiCfg["chatbot"] = json::object();
     aiCfg["chatbot"]["streaming"] = streaming;
     config.write("ai", aiCfg, true);
     emit isStreamingChanged();
@@ -2417,7 +3210,7 @@ void ChatBot::initModels() {
         info("创建默认模型配置");
         json defaultModel;
         defaultModel["id"]                 = m_model.toStdString();
-        defaultModel["name"]               = "DeepSeek Chat";
+        defaultModel["name"]               = "DeepSeek V4.1 Flash";
         defaultModel["provider"]           = "DeepSeek";
         defaultModel["endpoint"]           = m_apiEndpoint.toStdString();
         defaultModel["apiKey"]             = m_apiKey.toStdString();
@@ -2831,6 +3624,13 @@ bool ChatBot::switchSession(const QString& sessionId) {
         return false;
     }
     if (m_currentSessionId == sessionId) return true;
+
+    // 先收尾旧会话进行中的请求与工具调用
+    if (!m_activeReplies.isEmpty() || !m_toolCallBatch.isEmpty() || !m_pendingShellExecs.isEmpty()
+        || !m_activeShellExecs.isEmpty()) {
+        cancelRequest();
+    }
+
     m_currentSessionId = sessionId;
     saveSessions();
     emit messagesChanged();
@@ -2846,6 +3646,11 @@ QString ChatBot::createSession(const QString& title) {
     session.createdAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     session.updatedAt = session.createdAt;
 
+    if (!m_activeReplies.isEmpty() || !m_toolCallBatch.isEmpty() || !m_pendingShellExecs.isEmpty()
+        || !m_activeShellExecs.isEmpty()) {
+        cancelRequest();
+    }
+
     m_sessions.insert(session.id, session);
     m_currentSessionId = session.id;
     saveSessions();
@@ -2857,6 +3662,13 @@ QString ChatBot::createSession(const QString& title) {
 }
 
 bool ChatBot::deleteSession(const QString& sessionId) {
+    // 删除当前会话前先收尾进行中的请求
+    if (sessionId == m_currentSessionId
+        && (!m_activeReplies.isEmpty() || !m_toolCallBatch.isEmpty() || !m_pendingShellExecs.isEmpty()
+            || !m_activeShellExecs.isEmpty())) {
+        cancelRequest();
+    }
+
     if (!m_sessions.contains(sessionId)) {
         warn("删除会话失败：未找到 id={}", sessionId.toStdString());
         return false;
@@ -2905,40 +3717,182 @@ QVariantList ChatBot::getSessionMessages(const QString& sessionId) {
 }
 
 // -----------------------------------------------------------------------
-// Tavily 网络搜索
+// 网络搜索（Tavily / DeepSeek）
 // -----------------------------------------------------------------------
 
-void ChatBot::initTavily() {
+void ChatBot::initSearch() {
     json aiCfg = mod::Config::getInstance().read("ai");
-    if (!aiCfg.contains("tavily") || !aiCfg["tavily"].is_object()) return;
+    if (aiCfg.is_null() || !aiCfg.is_object()) return;
 
-    const auto& t       = aiCfg["tavily"];
-    m_tavilyApiKey      = QString::fromStdString(t.value("api_key", ""));
-    m_tavilySearchDepth = QString::fromStdString(t.value("search_depth", "advanced"));
-    m_tavilyMaxResults  = t.value("max_results", 5);
-    m_tavilyEnabled     = t.value("enabled", false);
+    json s = json::object();
+    if (aiCfg.contains("search") && aiCfg["search"].is_object()) s = aiCfg["search"];
+
+    const auto strOf = [](const json& o, const char* key, const std::string& def) {
+        return (o.contains(key) && o[key].is_string()) ? o[key].get<std::string>() : def;
+    };
+    const auto intOf = [](const json& o, const char* key, int def) {
+        return (o.contains(key) && o[key].is_number_integer()) ? o[key].get<int>() : def;
+    };
+    const auto boolOf = [](const json& o, const char* key, bool def) {
+        return (o.contains(key) && o[key].is_boolean()) ? o[key].get<bool>() : def;
+    };
+
+    QString provider = QString::fromStdString(strOf(s, "provider", "off"));
+    if (provider != "off" && provider != "tavily" && provider != "deepseek") provider = "off";
+
+    m_searchProvider        = provider;
+    m_searchEnabled         = boolOf(s, "enabled", false);
+    m_searchCount           = qBound(1, intOf(s, "count", 5), 50);
+    m_searchNeedContent     = boolOf(s, "need_content", false);
+    m_searchMaxChars        = qBound(500, intOf(s, "max_chars", 6000), 20000);
+    m_searchTavilyKey       = QString::fromStdString(strOf(s, "tavily_api_key", ""));
+    m_searchTavilyDepth     = QString::fromStdString(strOf(s, "tavily_search_depth", "advanced"));
+    m_searchDeepseekKey     = QString::fromStdString(strOf(s, "deepseek_api_key", ""));
+    m_searchDeepseekBaseUrl = QString::fromStdString(strOf(s, "deepseek_base_url", "https://api.deepseek.com"));
+    if (m_searchDeepseekBaseUrl.trimmed().isEmpty()) m_searchDeepseekBaseUrl = "https://api.deepseek.com";
+
+    // 迁移旧的 ai.tavily：只在新的配置还没有任何内容时执行一次
+    const json old = (aiCfg.contains("tavily") && aiCfg["tavily"].is_object()) ? aiCfg["tavily"] : json::object();
+    if (m_searchTavilyKey.isEmpty() && m_searchProvider == "off") {
+        const QString oldKey = QString::fromStdString(strOf(old, "api_key", ""));
+        if (!oldKey.isEmpty()) {
+            m_searchTavilyKey   = oldKey;
+            m_searchTavilyDepth = QString::fromStdString(strOf(old, "search_depth", "advanced"));
+            m_searchCount       = qBound(1, intOf(old, "max_results", 5), 50);
+            m_searchEnabled     = boolOf(old, "enabled", false);
+            m_searchProvider    = m_searchEnabled ? "tavily" : "off";
+            saveSearchConfig();
+            info("已迁移旧的 Tavily 配置到 ai.search");
+        }
+    }
+
+    emit searchConfigChanged();
     emit tavilyConfigChanged();
-    info("Tavily 配置已加载, enabled={}, configured={}", m_tavilyEnabled, !m_tavilyApiKey.isEmpty());
+    info(
+        "网络搜索配置已加载, provider={}, enabled={}, configured={}",
+        m_searchProvider.toStdString(),
+        m_searchEnabled,
+        searchConfigured()
+    );
 }
 
-void ChatBot::setTavilyEnabled(bool v) {
-    if (m_tavilyEnabled == v) return;
-    m_tavilyEnabled = v;
-
+void ChatBot::saveSearchConfig() {
     json aiCfg = mod::Config::getInstance().read("ai");
-    if (aiCfg.is_null()) aiCfg = json::object();
+    if (aiCfg.is_null() || !aiCfg.is_object()) aiCfg = json::object();
+    if (!aiCfg.contains("search") || !aiCfg["search"].is_object()) aiCfg["search"] = json::object();
+
+    json& s                  = aiCfg["search"];
+    s["provider"]            = m_searchProvider.toStdString();
+    s["enabled"]             = m_searchEnabled;
+    s["count"]               = m_searchCount;
+    s["need_content"]        = m_searchNeedContent;
+    s["max_chars"]           = m_searchMaxChars;
+    s["tavily_api_key"]      = m_searchTavilyKey.toStdString();
+    s["tavily_search_depth"] = m_searchTavilyDepth.toStdString();
+    s["deepseek_api_key"]    = m_searchDeepseekKey.toStdString();
+    s["deepseek_base_url"]   = m_searchDeepseekBaseUrl.toStdString();
+
+    // 旧字段同步一份，回退旧版本时仍可用
     if (!aiCfg.contains("tavily") || !aiCfg["tavily"].is_object()) aiCfg["tavily"] = json::object();
-    aiCfg["tavily"]["enabled"] = v;
+    aiCfg["tavily"]["api_key"]      = m_searchTavilyKey.toStdString();
+    aiCfg["tavily"]["search_depth"] = m_searchTavilyDepth.toStdString();
+    aiCfg["tavily"]["max_results"]  = m_searchCount;
+    aiCfg["tavily"]["enabled"]      = (m_searchProvider == "tavily" && m_searchEnabled);
+
     mod::Config::getInstance().write("ai", aiCfg, true);
+}
+
+bool ChatBot::searchConfigured() const {
+    if (m_searchProvider == "tavily") return !m_searchTavilyKey.isEmpty();
+    if (m_searchProvider == "deepseek") return !effectiveSearchKey().isEmpty();
+    return false;
+}
+
+bool ChatBot::searchToolAvailable() const { return m_capToolCall && m_searchEnabled && searchConfigured(); }
+
+QString ChatBot::effectiveSearchKey() const {
+    if (m_searchProvider == "deepseek") return m_searchDeepseekKey.isEmpty() ? m_apiKey : m_searchDeepseekKey;
+    return m_searchTavilyKey;
+}
+
+void ChatBot::setSearchProvider(const QString& provider) {
+    const QString p = (provider == "tavily" || provider == "deepseek") ? provider : "off";
+    if (m_searchProvider == p) return;
+    m_searchProvider = p;
+    saveSearchConfig();
+    emit searchConfigChanged();
     emit tavilyConfigChanged();
+}
+
+void ChatBot::setSearchEnabled(bool v) {
+    if (m_searchEnabled == v) return;
+    m_searchEnabled = v;
+    saveSearchConfig();
+    emit searchConfigChanged();
+    emit tavilyConfigChanged();
+}
+
+void ChatBot::setSearchCount(int count) {
+    count = qBound(1, count, 50);
+    if (m_searchCount == count) return;
+    m_searchCount = count;
+    saveSearchConfig();
+    emit searchConfigChanged();
+    emit tavilyConfigChanged();
+}
+
+// 旧属性：只映射 Tavily，保留给旧版资源库
+void ChatBot::setTavilyEnabled(bool v) {
+    m_searchEnabled = v;
+    if (v && m_searchProvider == "off") m_searchProvider = "tavily";
+    saveSearchConfig();
+    emit searchConfigChanged();
+    emit tavilyConfigChanged();
+}
+
+QString ChatBot::getSearchConfig() {
+    json obj;
+    obj["provider"]        = m_searchProvider.toStdString();
+    obj["enabled"]         = m_searchEnabled;
+    obj["count"]           = m_searchCount;
+    obj["needContent"]     = m_searchNeedContent;
+    obj["tavilyApiKey"]    = m_searchTavilyKey.toStdString();
+    obj["deepseekApiKey"]  = m_searchDeepseekKey.toStdString();
+    obj["deepseekBaseUrl"] = m_searchDeepseekBaseUrl.toStdString();
+    return QString::fromStdString(obj.dump(2));
+}
+
+void ChatBot::setSearchConfig(const QString& configJson) {
+    QJsonDocument doc = QJsonDocument::fromJson(configJson.toUtf8());
+    if (!doc.isObject()) return;
+
+    QJsonObject obj = doc.object();
+    if (obj.contains("provider")) {
+        const QString p = obj["provider"].toString();
+        if (p == "off" || p == "tavily" || p == "deepseek") m_searchProvider = p;
+    }
+    if (obj.contains("enabled")) m_searchEnabled = obj["enabled"].toBool();
+    if (obj.contains("count")) m_searchCount = qBound(1, obj["count"].toInt(5), 50);
+    if (obj.contains("needContent")) m_searchNeedContent = obj["needContent"].toBool();
+    if (obj.contains("tavilyApiKey")) m_searchTavilyKey = obj["tavilyApiKey"].toString();
+    if (obj.contains("deepseekApiKey")) m_searchDeepseekKey = obj["deepseekApiKey"].toString();
+    if (obj.contains("deepseekBaseUrl")) {
+        const QString url       = obj["deepseekBaseUrl"].toString().trimmed();
+        m_searchDeepseekBaseUrl = url.isEmpty() ? "https://api.deepseek.com" : url;
+    }
+
+    saveSearchConfig();
+    emit searchConfigChanged();
+    emit tavilyConfigChanged();
+    info("网络搜索配置已保存");
 }
 
 QString ChatBot::getTavilyConfig() {
     json obj;
-    obj["apiKey"]      = m_tavilyApiKey.toStdString();
-    obj["searchDepth"] = m_tavilySearchDepth.toStdString();
-    obj["maxResults"]  = m_tavilyMaxResults;
-    obj["enabled"]     = m_tavilyEnabled;
+    obj["apiKey"]      = m_searchTavilyKey.toStdString();
+    obj["searchDepth"] = m_searchTavilyDepth.toStdString();
+    obj["maxResults"]  = m_searchCount;
+    obj["enabled"]     = getTavilyEnabled();
     return QString::fromStdString(obj.dump(2));
 }
 
@@ -2947,19 +3901,16 @@ void ChatBot::setTavilyConfig(const QString& configJson) {
     if (!doc.isObject()) return;
 
     QJsonObject obj = doc.object();
-    if (obj.contains("apiKey")) m_tavilyApiKey = obj["apiKey"].toString();
-    if (obj.contains("searchDepth")) m_tavilySearchDepth = obj["searchDepth"].toString();
-    if (obj.contains("maxResults")) m_tavilyMaxResults = obj["maxResults"].toInt(5);
-    if (obj.contains("enabled")) m_tavilyEnabled = obj["enabled"].toBool();
+    if (obj.contains("apiKey")) m_searchTavilyKey = obj["apiKey"].toString();
+    if (obj.contains("searchDepth")) m_searchTavilyDepth = obj["searchDepth"].toString();
+    if (obj.contains("maxResults")) m_searchCount = qBound(1, obj["maxResults"].toInt(5), 50);
+    if (obj.contains("enabled")) {
+        m_searchEnabled = obj["enabled"].toBool();
+        if (m_searchEnabled && m_searchProvider == "off") m_searchProvider = "tavily";
+    }
 
-    json aiCfg = mod::Config::getInstance().read("ai");
-    if (aiCfg.is_null()) aiCfg = json::object();
-    if (!aiCfg.contains("tavily") || !aiCfg["tavily"].is_object()) aiCfg["tavily"] = json::object();
-    aiCfg["tavily"]["api_key"]      = m_tavilyApiKey.toStdString();
-    aiCfg["tavily"]["search_depth"] = m_tavilySearchDepth.toStdString();
-    aiCfg["tavily"]["max_results"]  = m_tavilyMaxResults;
-    aiCfg["tavily"]["enabled"]      = m_tavilyEnabled;
-    mod::Config::getInstance().write("ai", aiCfg, true);
+    saveSearchConfig();
+    emit searchConfigChanged();
     emit tavilyConfigChanged();
     info("Tavily 配置已保存");
 }
@@ -2981,13 +3932,15 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
         }
         );
 
-    if (m_capToolCall && m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) {
+    if (searchToolAvailable()) {
         QJsonObject funcParam;
         funcParam["type"] = "object";
 
         QJsonObject queryProp;
-        queryProp["type"]        = "string";
-        queryProp["description"] = "The search query in the user's language";
+        queryProp["type"] = "string";
+        queryProp["description"] =
+            "The search query in the user's language. Supports site:, -site:, lang:, after:, before: and quoted "
+            "phrases.";
 
         QJsonObject properties;
         properties["query"] = queryProp;
@@ -2996,9 +3949,10 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
         funcParam["required"]   = QJsonArray({"query"});
 
         QJsonObject func;
-        func["name"]        = "tavily_search";
+        func["name"]        = "web_search";
         func["description"] = "Search the web for up-to-date information. Use when the user asks about current events, "
-                              "recent facts, or anything outside your training data.";
+                              "recent facts, anything after your training data, or when a fact needs verification. "
+                              "Returns titles, URLs, dates and summaries.";
         func["parameters"]  = funcParam;
 
         if (usesResponsesApi()) {
@@ -3051,75 +4005,144 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
 
 void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
     if (m_cancelled) return;
-
-    QJsonDocument doc = QJsonDocument::fromJson(toolCallsJson.toUtf8());
+    const auto doc = QJsonDocument::fromJson(toolCallsJson.toUtf8());
     if (!doc.isArray()) {
+        finishOutstandingTools("error", "工具调用格式无效");
         emit toolCallReceived(toolCallsJson);
+        emit errorOccurred("工具调用格式无效，本次没有执行");
         return;
     }
-
-    QJsonArray arr = doc.array();
+    auto calls = doc.array();
     m_toolCallBatch.clear();
-
-    // 注册所有已知工具调用到 batch 中
-    for (const auto& val : arr) {
-        QJsonObject tc   = val.toObject();
-        QString     id   = tc["id"].toString();
-        QString     name = tc["function"].toObject()["name"].toString();
-        if (name == "tavily_search" || name == "shell_exec") {
-            m_toolCallBatch.append({id, name, false, ""});
+    QSet<QString> ids;
+    QSet<QString> invalidIds;
+    // Register every entry before any synchronous rejection can resolve the batch.
+    for (int i = 0; i < calls.size(); ++i) {
+        auto call = calls[i].toObject();
+        auto id = call["id"].toString();
+        if (id.isEmpty() || ids.contains(id)) {
+            id = m_responseMessageId + "_invalid_" + QString::number(i);
+            call["id"] = id;
+            invalidIds.insert(id);
+            calls[i] = call;
+        }
+        ids.insert(id);
+        prepareTool(i, json::parse(QJsonDocument(call).toJson().toStdString()));
+        m_toolCallBatch.append({id, call["function"].toObject()["name"].toString(), false, ""});
+    }
+    // Store repaired IDs only locally and in the API's own tool_calls field.
+    for (auto& message : currentMessages()) {
+        if (message.messageId == m_responseMessageId) {
+            message.toolCallsJson = QString::fromUtf8(QJsonDocument(calls).toJson(QJsonDocument::Compact));
+            message.toolStates = m_responseToolStates;
         }
     }
-
-    if (m_toolCallBatch.isEmpty()) {
-        emit toolCallReceived(toolCallsJson);
-        return;
+    emit toolCallReceived(toolCallsJson);
+    for (const auto& value : calls) {
+        if (m_cancelled) break;
+        const auto call = value.toObject();
+        const auto id = call["id"].toString();
+        const auto fn = call["function"].toObject();
+        const auto name = fn["name"].toString();
+        const auto args = QJsonDocument::fromJson(fn["arguments"].toString().toUtf8());
+        const bool search = name == "web_search" || name == "tavily_search" || name == "deepseek_search";
+        const bool shell = name == "shell_exec";
+        const auto argument = args.object().value(search ? "query" : "command");
+        QString failure;
+        if (invalidIds.contains(id) || !args.isObject() || !argument.isString()
+            || argument.toString().trimmed().isEmpty()) failure = "工具调用参数无效或不完整，本次没有执行。";
+        else if (!(search && searchToolAvailable()) && !(shell && m_capToolCall && m_shellToolEnabled))
+            failure = "工具 " + name + " 当前不可用或未启用，本次没有执行。";
+        else if (shell && isCommandBlocked(argument.toString())) failure = "命令被安全策略拦截，本次没有执行。";
+        if (!failure.isEmpty()) {
+            updateTool(id, "error", failure, failure);
+            submitToolResultBatched(id, name, failure);
+            if (shell) emit shellCommandFinished(id, false, failure, fn["arguments"].toString());
+        } else if (search) {
+            executeWebSearch(id, argument.toString());
+        } else {
+            m_pendingShellExecs.append({id, argument.toString()});
+            emit shellCommandPending(id, argument.toString());
+        }
     }
+    // All unavailable calls still have results and a visible terminal state.
+    saveSessions();
+    if (calls.isEmpty()) {
+        finishOutstandingTools("error", "工具调用为空");
+        emit errorOccurred("工具调用为空，本次没有执行");
+    }
+}
 
-    // 分发执行
-    for (const auto& val : arr) {
-        if (m_cancelled) return;
-        QJsonObject tc   = val.toObject();
-        QString     name = tc["function"].toObject()["name"].toString();
-        QString     id   = tc["id"].toString();
-        QString     args = tc["function"].toObject()["arguments"].toString();
+void ChatBot::executeWebSearch(const QString& toolCallId, const QString& query) {
+    if (m_searchProvider == "deepseek") executeDeepSeekSearch(toolCallId, query);
+    else executeTavilySearch(toolCallId, query);
+}
 
-        if (name == "tavily_search") {
-            QString       query;
-            QJsonDocument argsDoc = QJsonDocument::fromJson(args.toUtf8());
-            if (argsDoc.isObject()) query = argsDoc.object()["query"].toString();
-            if (query.isEmpty()) query = args;
-            executeTavilySearch(id, query);
-        } else if (name == "shell_exec") {
-            QString       command;
-            QJsonDocument argsDoc = QJsonDocument::fromJson(args.toUtf8());
-            if (argsDoc.isObject()) command = argsDoc.object()["command"].toString();
-            if (command.isEmpty()) command = args;
+QString ChatBot::formatSearchResults(const QString& query, const QJsonArray& results, bool includeContent) const {
+    QString   formatted           = QString("网络搜索结果（查询: \"%1\"）：\n\n").arg(query);
+    int       count               = 0;
+    const int perItemContentLimit = 1500;
 
-            if (isCommandBlocked(command)) {
-                submitToolResultBatched(id, "shell_exec", "该命令被安全策略拦截，无法执行。请换一种方式。");
-                emit shellCommandFinished(id, false, "命令被安全策略拦截", command);
-            } else {
-                m_pendingShellExecs.append({id, command});
-                emit shellCommandPending(id, command);
+    for (const auto& val : results) {
+        QJsonObject r = val.toObject();
+
+        QString title = r["title"].toString();
+        QString url   = r["url"].toString();
+        // summary 是官方给模型阅读的长摘要；snippet/content 作为兼容回退
+        QString summary = r["summary"].toString();
+        if (summary.isEmpty()) summary = r["snippet"].toString();
+        if (summary.isEmpty()) summary = r["content"].toString();
+        if (summary.isEmpty() && url.isEmpty()) continue;
+
+        QStringList meta;
+        QString     date = r["date"].toString();
+        if (date.isEmpty()) date = r["published_date"].toString();
+        if (!date.isEmpty()) meta << date;
+        const QString site = r["site_name"].toString();
+        if (!site.isEmpty()) meta << site;
+
+        QString item = QString("%1. %2\n   %3\n").arg(++count).arg(title.isEmpty() ? url : title).arg(url);
+        if (!meta.isEmpty()) item += "   " + meta.join(" | ") + "\n";
+
+        if (!summary.isEmpty()) {
+            if (summary.length() > 800) summary = summary.left(800) + "…";
+            summary.replace("\n", " ");
+            item += "   " + summary + "\n";
+        }
+        item += "\n";
+
+        if (includeContent) {
+            QString content = r["content"].toString();
+            if (!content.isEmpty()) {
+                if (content.length() > perItemContentLimit) content = content.left(perItemContentLimit) + "…";
+                item += content + "\n\n";
             }
         }
+
+        if (formatted.length() + item.length() > m_searchMaxChars) {
+            formatted += "（结果已按长度截断）\n";
+            break;
+        }
+        formatted += item;
     }
+
+    return count == 0 ? QString() : formatted;
 }
 
 void ChatBot::executeTavilySearch(const QString& toolCallId, const QString& query) {
     info("Tavily 搜索: {}", query.toStdString());
+    emit webSearchStarted(toolCallId, query);
     emit tavilySearchStarted(toolCallId, query);
 
     QJsonObject body;
     body["query"]        = query;
-    body["search_depth"] = m_tavilySearchDepth;
-    body["max_results"]  = m_tavilyMaxResults;
+    body["search_depth"] = m_searchTavilyDepth;
+    body["max_results"]  = m_searchCount;
 
     QNetworkRequest request;
     request.setUrl(QUrl("https://api.tavily.com/search"));
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", QString("Bearer %1").arg(m_tavilyApiKey).toUtf8());
+    request.setRawHeader("Authorization", QString("Bearer %1").arg(m_searchTavilyKey).toUtf8());
     request.setRawHeader("User-Agent", "PenMods ChatBot/1.0");
 
     QByteArray     data  = QJsonDocument(body).toJson(QJsonDocument::Compact);
@@ -3132,47 +4155,157 @@ void ChatBot::executeTavilySearch(const QString& toolCallId, const QString& quer
             return;
         }
         m_activeReplies.removeAll(reply);
+
+        if (m_cancelled) {
+            reply->deleteLater();
+            return;
+        }
+
+        const auto       netError = reply->error();
+        const QString    errMsg   = reply->errorString();
+        const QByteArray raw      = reply->readAll();
         reply->deleteLater();
 
-        if (m_cancelled) return;
-
-        if (reply->error() != QNetworkReply::NoError) {
-            QString errMsg = reply->errorString();
+        if (netError != QNetworkReply::NoError) {
             warn("Tavily 搜索失败: {}", errMsg.toStdString());
-            submitToolResultBatched(toolCallId, "tavily_search", "搜索失败: " + errMsg);
+            submitToolResultBatched(toolCallId, "web_search", "搜索失败: " + errMsg);
+            emit webSearchFinished(toolCallId, false, errMsg, errMsg);
             emit tavilySearchFinished(toolCallId, false, errMsg, errMsg);
             return;
         }
 
-        QByteArray    raw = reply->readAll();
         QJsonDocument doc = QJsonDocument::fromJson(raw);
         if (!doc.isObject()) {
-            submitToolResultBatched(toolCallId, "tavily_search", "搜索失败: 响应格式错误");
+            submitToolResultBatched(toolCallId, "web_search", "搜索失败: 响应格式错误");
+            emit webSearchFinished(toolCallId, false, "响应格式错误", "响应格式错误");
             emit tavilySearchFinished(toolCallId, false, "响应格式错误", "响应格式错误");
             return;
         }
 
-        QJsonArray results = doc.object()["results"].toArray();
-        if (results.isEmpty()) {
-            submitToolResultBatched(toolCallId, "tavily_search", "未找到相关结果");
+        const QJsonArray results   = doc.object()["results"].toArray();
+        const QString    formatted = formatSearchResults(query, results, true);
+        if (formatted.isEmpty()) {
+            submitToolResultBatched(toolCallId, "web_search", "未找到相关结果");
+            emit webSearchFinished(toolCallId, true, "未找到结果", "未找到相关结果");
             emit tavilySearchFinished(toolCallId, true, "未找到结果", "未找到相关结果");
             return;
         }
 
-        QString formatted = QString("网络搜索结果（查询: \"%1\"）：\n\n").arg(query);
-        int     count     = 0;
-        for (const auto& val : results) {
-            QJsonObject r  = val.toObject();
-            formatted     += QString("%1. %2 (%3)\n   %4\n\n")
-                                 .arg(++count)
-                                 .arg(r["title"].toString())
-                                 .arg(r["url"].toString())
-                                 .arg(r["content"].toString());
-        }
-
-        submitToolResultBatched(toolCallId, "tavily_search", formatted);
+        const int count = results.size();
+        submitToolResultBatched(toolCallId, "web_search", formatted);
+        emit webSearchFinished(toolCallId, true, QString("找到 %1 条结果").arg(count), formatted);
         emit tavilySearchFinished(toolCallId, true, QString("找到 %1 条结果").arg(count), formatted);
         info("Tavily 搜索完成，找到 {} 条结果", count);
+    });
+}
+
+void ChatBot::executeDeepSeekSearch(const QString& toolCallId, const QString& query) {
+    info("DeepSeek 搜索: {}", query.toStdString());
+    emit webSearchStarted(toolCallId, query);
+    emit tavilySearchStarted(toolCallId, query);
+    requestDeepSeekSearch(toolCallId, query, 0);
+}
+
+void ChatBot::requestDeepSeekSearch(const QString& toolCallId, const QString& query, int attempt) {
+    const QString key = effectiveSearchKey();
+    if (key.isEmpty()) {
+        const QString err = "未配置 DeepSeek API Key";
+        submitToolResultBatched(toolCallId, "web_search", "搜索失败: " + err);
+        emit webSearchFinished(toolCallId, false, err, err);
+        emit tavilySearchFinished(toolCallId, false, err, err);
+        return;
+    }
+
+    QJsonObject body;
+    body["query"]        = query;
+    body["count"]        = m_searchCount;
+    body["need_content"] = m_searchNeedContent;
+
+    // 允许配置 http(s)://host 或 http(s)://host/v1
+    QString base = m_searchDeepseekBaseUrl.trimmed();
+    while (base.endsWith('/')) base.chop(1);
+    if (base.endsWith("/v1")) base.chop(3);
+    const QUrl url(base + "/v1/tools/search");
+
+    QNetworkRequest request;
+    request.setUrl(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("Authorization", QString("Bearer %1").arg(key).toUtf8());
+    request.setRawHeader("User-Agent", "PenMods ChatBot/1.0");
+
+    QByteArray     data  = QJsonDocument(body).toJson(QJsonDocument::Compact);
+    QNetworkReply* reply = m_networkManager->post(request, data);
+    m_activeReplies.append(reply);
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply, toolCallId, query, attempt]() {
+        if (!m_activeReplies.contains(reply)) {
+            reply->deleteLater();
+            return;
+        }
+        m_activeReplies.removeAll(reply);
+
+        if (m_cancelled) {
+            reply->deleteLater();
+            return;
+        }
+
+        const int        httpStatus  = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const auto       netError    = reply->error();
+        const QString    netErrorStr = reply->errorString();
+        const QByteArray raw         = reply->readAll();
+        reply->deleteLater();
+
+        if (netError != QNetworkReply::NoError) {
+            const bool retryable = (httpStatus == 408 || httpStatus == 429 || httpStatus >= 500);
+            if (retryable && attempt < 1) {
+                info("DeepSeek 搜索暂时失败（HTTP {}），1.5s 后重试", httpStatus);
+                const auto seq = m_requestSeq;
+                QTimer::singleShot(1500, this, [this, toolCallId, query, attempt, seq]() {
+                    if (m_cancelled || seq != m_requestSeq) return;
+                    requestDeepSeekSearch(toolCallId, query, attempt + 1);
+                });
+                return;
+            }
+
+            QString errMsg;
+            // DeepSeek 错误格式：{"error":{"message":"...", ...}}
+            const QJsonObject errObj = QJsonDocument::fromJson(raw).object()["error"].toObject();
+            if (errObj.contains("message")) errMsg = errObj["message"].toString();
+            if (errMsg.isEmpty()) {
+                if (httpStatus == 401) errMsg = "DeepSeek API Key 无效";
+                else if (httpStatus == 402) errMsg = "DeepSeek 账户余额不足，请充值后重试";
+                else if (httpStatus == 429) errMsg = "搜索请求过于频繁，请稍后再试";
+                else errMsg = netErrorStr;
+            }
+            warn("DeepSeek 搜索失败: HTTP {}, {}", httpStatus, errMsg.toStdString());
+            submitToolResultBatched(toolCallId, "web_search", "搜索失败: " + errMsg);
+            emit webSearchFinished(toolCallId, false, errMsg, errMsg);
+            emit tavilySearchFinished(toolCallId, false, errMsg, errMsg);
+            return;
+        }
+
+        QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isObject()) {
+            submitToolResultBatched(toolCallId, "web_search", "搜索失败: 响应格式错误");
+            emit webSearchFinished(toolCallId, false, "响应格式错误", "响应格式错误");
+            emit tavilySearchFinished(toolCallId, false, "响应格式错误", "响应格式错误");
+            return;
+        }
+
+        const QJsonArray results   = doc.object()["results"].toArray();
+        const QString    formatted = formatSearchResults(query, results, m_searchNeedContent);
+        if (formatted.isEmpty()) {
+            submitToolResultBatched(toolCallId, "web_search", "未找到相关结果");
+            emit webSearchFinished(toolCallId, true, "未找到结果", "未找到相关结果");
+            emit tavilySearchFinished(toolCallId, true, "未找到结果", "未找到相关结果");
+            return;
+        }
+
+        const int count = results.size();
+        submitToolResultBatched(toolCallId, "web_search", formatted);
+        emit webSearchFinished(toolCallId, true, QString("找到 %1 条结果").arg(count), formatted);
+        emit tavilySearchFinished(toolCallId, true, QString("找到 %1 条结果").arg(count), formatted);
+        info("DeepSeek 搜索完成，找到 {} 条结果", count);
     });
 }
 
@@ -3298,29 +4431,9 @@ void ChatBot::denyShellCommand(const QString& toolCallId) {
         if (m_pendingShellExecs[i].toolCallId == toolCallId) {
             auto pending = m_pendingShellExecs.takeAt(i);
 
-            // 将所有未完成的 batch 条目标记为已拒绝，并写入 history，
-            // 避免下次 sendMessage/editMessage 时 API 看到 tool_calls 却无对应 tool_result 而报 Bad request
-            for (auto& entry : m_toolCallBatch) {
-                if (!entry.resolved) {
-                    entry.resolved = true;
-                    entry.result   = "用户拒绝了该操作";
-                }
-            }
-            for (const auto& entry : m_toolCallBatch) {
-                MessageData toolMsg;
-                toolMsg.role       = "tool";
-                toolMsg.toolCallId = entry.id;
-                toolMsg.content    = entry.result;
-                currentMessages().append(toolMsg);
-                if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
-            }
-            m_toolCallBatch.clear();
-            m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
-            saveSessions();
-            emit messagesChanged();
-
+            updateTool(toolCallId, "cancelled", "用户拒绝执行", pending.command);
+            submitToolResultBatched(toolCallId, "shell_exec", "用户拒绝了该操作");
             emit shellCommandFinished(toolCallId, false, "用户拒绝执行", pending.command);
-            cancelRequest();
             return;
         }
     }
@@ -3427,17 +4540,6 @@ void ChatBot::executeShellCommand(const QString& toolCallId, const QString& comm
 
             warn("Shell 命令超时 [{}]: {}", toolCallId.toStdString(), e->command.toStdString());
 
-            // 杀掉进程。kill() 会在同线程同步触发 finished 信号，
-            // finished 处理器会调用 cleanupShellExec 删除 e，所以 kill 后 e 可能已失效。
-            if (e->process->state() != QProcess::NotRunning) {
-                e->process->kill();
-            }
-
-            // 检查 entry 是否还在（可能在 kill() 同步触发的 finished 信号中被清理了）
-            e = m_activeShellExecs.value(toolCallId);
-            if (!e) return;
-
-            // finished 信号未处理（进程已自行结束但信号未传递），直接处理
             QString resultText  = QString("命令超时（%1ms）。\n").arg(m_shellToolTimeoutMs);
             resultText         += "stdout:\n" + e->stdoutBuf + "\n";
             resultText         += "stderr:\n" + e->stderrBuf + "\n";
@@ -3470,7 +4572,6 @@ void ChatBot::cleanupShellExec(const QString& toolCallId) {
         e->process->disconnect(this);
         if (e->process->state() != QProcess::NotRunning) {
             e->process->kill();
-            // 异步场景下不使用 waitForFinished，避免阻塞
             e->process->waitForFinished(200);
         }
         e->process->deleteLater();
