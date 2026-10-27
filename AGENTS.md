@@ -2,6 +2,46 @@
 
 Guidance for AI coding agents working in this repository.
 
+## Non-negotiable rules (highest priority)
+
+These override any conflicting guidance below. If a change cannot satisfy them, stop and ask.
+
+### Language and runtime
+
+- **C++23**, not C++26. `set_languages('cxx23', 'c11')`; do not raise the standard without a Qt/libc++ compatibility spike.
+- **New core code uses headers** (`.h` / `.cpp`). C++20 modules are disabled for now: the Zig device toolchain cannot build `.cppm` on glibc 2.27, and Qt 5.15's moc does not combine cleanly with them. Do not add `.cppm` unless a maintained cross toolchain is adopted.
+- Core code in `src/chatbot/session|context|protocol` must stay **host-free**: no `Base.h`, `Hook.h`, `Event.h`, `mod/Config.h`, `mod/Mod.h`, `Utils.h`, `showToast()`, singletons. Inject dependencies.
+- Qt types are allowed where they reduce code or match an existing data model (`MessageData`, `QString`); do not force std conversions just for purity. Prefer std types for new domain/storage data when it buys host-testability or avoids Qt 5.15 coupling, but this is a guideline, not a hard rule.
+- Runtime contract: **dynamic glibc 2.27 + static libc++ / libc++abi / libunwind; no libstdc++**. Verify after linking: `readelf -d` has no `libstdc++.so.6` / `libc++.so`; `readelf --version-info` has no `GLIBCXX_*` / `CXXABI_*` and max `GLIBC_*` <= 2.27.
+- The device build currently uses the **Zig toolchain**; the Clang/libc++ migration was attempted and abandoned. Do not add Clang-specific build steps or new `.cppm` files.
+
+### Memory safety
+
+- No naked `new` / `delete` / `malloc` / `free` in `src/` (vendored C excepted); use `std::make_unique`, Qt parent ownership, `qScopeGuard`.
+- Non-owning parameters use `QStringView` / `std::string_view` / `std::span`; no stored `const char*`.
+- No raw `this` captures in async callbacks; use `QPointer`, context-bound `connect`, or `weak_ptr`.
+- No `reinterpret_cast` outside hook/ABI code; document each.
+- Validate external JSON/DB/network data before indexing; use size checks + `operator[]` / `std::span`, no pointer arithmetic. Avoid throwing `.at()` in core.
+- New core code must pass ASan/UBSan host tests; touched files run clang-tidy (`bugprone`, `cert`, `modernize`, `performance`).
+
+### Error handling (Rust-style, no exceptions for recoverable errors)
+
+- Recoverable errors are values: return `std::expected<T, E>` (C++23), or `std::expected<void, E>` for status. Do not use `try`/`catch` for control flow, parsing failures, DB errors, or network errors.
+- Define one project error type, e.g. `struct Error { ErrorCode code; std::string message; };` and `template<class T> using Result = std::expected<T, Error>;`.
+- Constructors that can fail use a static factory returning `Result<T>` plus a private constructor. Destructors never fail; provide `close()` returning `Result<void>`.
+- Do not build with `-fno-exceptions`; Qt/libc++ need them. Exceptions are only for truly exceptional conditions (e.g. `std::bad_alloc`) and must never cross Qt/C ABI or module boundaries.
+- A third-party API that throws may be wrapped in exactly one adapter-layer `try`/`catch` that converts to `Error`; the exception must not escape that adapter. Examples: SQLiteCpp, runtime `std::format`, `nlohmann::json::parse` (prefer its non-throwing overload).
+- Avoid throwing APIs in core: `nlohmann::json::parse(..., nullptr, false)` + `is_discarded()`, `std::from_chars` instead of `std::stoi`, compile-time `std::format` strings, explicit size validation instead of `.at()`.
+- Mark fallible APIs `[[nodiscard]]`; never ignore a `Result`. The Qt facade unwraps `Result` and emits `errorOccurred` / Toast; QML slots never see `expected`.
+
+### Don't reinvent the wheel
+
+- Use the standard library, Qt, and existing deps first: nlohmann_json, spdlog, SQLite, zstd, `MarkdownParser`, `AttachmentManager`; host tests use doctest.
+- Do not hand-write: JSON parsing, compression, HTTP/SSE clients, log rotation, test frameworks, UUID, time/filesystem, SQL statement/transaction lifetimes.
+- Add a dependency only with a one-line reason (why existing libs are insufficient; header-only/static/ARM64 availability).
+- Write only domain logic: session event model, context assembly, protocol mapping, tool orchestration.
+- Do not add a library just to look modern; do not hand-write infrastructure just to save a dependency.
+
 ## What This Project Is
 
 PenMods is a runtime mod framework for **NetEase Youdao Dictionary Pen** devices (YDP02X, YDPG3, YDP03X). It produces `libPenMods.so`, injected via `LD_PRELOAD` into the closed-source `YoudaoDictPen` binary (ARM64 Linux, rk3326, Qt 5.15.2, glibc 2.27). Hooking is done via [Dobby](https://github.com/jmpews/Dobby).
@@ -372,13 +412,34 @@ Package `com.github.penuniverse` (1.0). Context properties registered in Engine.
 - Restart the `YoudaoDictPen` process after pushing the resource library so the new `.so` is loaded.
 - The generated header may contain formatting artifacts from `rcc`; do not hand-edit the generated file to satisfy formatting or whitespace checks.
 
+### AI Session Layer (`src/chatbot`)
+
+The chatbot backend was rewritten from scratch; `Backend.cpp/.h` are **gone** and must not be reintroduced.
+
+- `src/chatbot/facade/ChatBot.{h,cpp}` is the QML-facing singleton. It owns no protocol/SQL logic; it delegates to
+  `session/`, `context/`, `protocol/`, `model/`, `tools/`, `engine/`. Keep the QML contract (46 invokable / 31 property /
+  43 signal) intact; `tests/check_chatbot_contract.py --base <rev>` compares it against the last revision that still had
+  the old header.
+- Sessions are event-level: `SessionStore` / `SessionRepository` / `SessionManager` append events and rewrite only the
+  affected tail. There is **no** whole-session snapshot writer. Do not add one.
+- SQLite lives at `<module dir>/penmods.db` (`/userdisk/PenMods/penmods.db` on device). `PRAGMA user_version` guards
+  against a database written by a newer build.
+- Settings still live in the mod config `ai` section (`/userdisk/PenModsconfig.json`, note the missing slash); the old
+  `sessions.json` is **not** migrated and must be left alone.
+- Update `doc/AI_SESSION_PROGRESS.md` when behavior, tests or device state change.
+
 ### Chatbot Vision Safety
 
-- `src/chatbot/Backend.cpp` uses an asynchronous two-stage flow when a non-vision model delegates image analysis to a vision proxy. Do not reintroduce a nested `QEventLoop` or synchronously wait for `QNetworkReply` on the UI thread.
-- All chatbot network replies, including vision-proxy replies, must be tracked in `m_activeReplies`. Cancellation must first remove replies from the active list and disconnect callbacks, then abort and schedule deletion; aborting while iterating the live list can re-enter `finished` handlers and invalidate the iteration.
-- Inline `data:` image URLs are request-scoped. Do not persist their Base64 payloads in session history or log complete request bodies. HTTP image URLs may remain in history. Existing sessions are sanitized when loaded.
-- Keep a bounded media payload before JSON parsing/serialization (currently 12 MiB), and validate empty/malformed media and API responses before indexing arrays such as `choices`.
-- The vision-proxy completion callback is tied to both `m_requestSeq` and the originating session. A cancelled, superseded, or session-switched request must not append messages or launch the second-stage model request.
+Vision proxy is **not implemented** in the rewrite (deliberately scoped out for now):
+`sendMessageWithMedia` drops images with a toast when the active model lacks vision, and returns an explicit error if
+`proxyVisionModelId` is configured. Do not silently send large `data:` images to a non-vision model.
+
+- Inline `data:` image URLs are request-scoped and must not be persisted (AttachmentManager strips them into files).
+- `ChatEngine` caps non-stream response bodies (8 MiB) and reports a terminal result exactly once; cancellation must
+  stop the transport and never let a late callback append to a switched session.
+- The engine's idle watchdog is 30 s; tool batches have a 45 s fallback so a lost tool callback cannot wedge the UI.
+- When adding new providers/tools, keep provider-specific wire code in `protocol/` and tool execution in `tools/`; the
+  facade only translates signals/JSON.
 
 ### Plugin System
 
@@ -437,8 +498,10 @@ render them into the frame before the autorotate post-filter if that ever needs 
 (GPL-3.0) — a Qt 5 QML video player that renders **into the host scene graph** (custom `QSGNode`, static FFmpeg
 3.4.8 + libass + OpenSSL 3 + libxml2), so the picture follows `YMainWindow.rotation` and PenMods controls can sit on
 top of it. `xmake build ffmpegplayerplugin` produces `build/<plat>/<arch>/<mode>/qml/FFmpegPlayer/`;
-`scripts/deploy_ffmpeg_player.sh` pushes it to `/userdata/PenMods/qml/FFmpegPlayer/` (tmp + rename, then restarts
-the app). `src/mod/Engine.cpp` adds `/userdata/PenMods/qml` as an import path before the main QML loads, so the page
+`scripts/deploy_ffmpeg_player.sh` pushes it to `/userdisk/PenMods/qml/FFmpegPlayer/` (tmp + rename, then restarts
+the app). That exact path matters: `ExternalPlayer::hasEmbeddedPlayer()` checks `/userdisk` on YDP03X, so deploying to
+`/userdata` makes every video silently fall back to mpv (`MPV fallback failed ... Unknown error`).
+`src/mod/Engine.cpp` adds `/userdata/PenMods/qml` and `/userdisk/PenMods/qml` as import paths before the main QML loads, so the page
 `resource/models/YDP02X/qml/audiopages/ExternalPlayer.qml` can `import FFmpegPlayer 1.0`;
 `ExternalPlayer::open()` skips the mpv process while that module exists (mpv stays the fallback). Full analysis and
 device measurements: `doc/FFMPEG_PLAYER_ANALYSIS.md`.
@@ -450,6 +513,10 @@ device measurements: `doc/FFMPEG_PLAYER_ANALYSIS.md`.
   VPU-enabled kernel/DTB the same build uses `h264_rkmpp`/`hevc_rkmpp` and `hardwareDecoding` becomes true. Any process
   that loads this plugin outside the mod (e.g. `qmlscene` smoke tests) must set `FFPLAYER_HWDEC=0` itself — note the
   device's `adbd` environment may already carry it (`cat /proc/$(pidof adbd)/environ`).
+- **Verified on the YDP03X test unit (VPU unlocked):** `/dev/vpu_service` exists and `vpu_combo/status` is `okay`, so
+  playback logs `Using hardware decoder: h264_rkmpp`, `Video renderer: OpenGL YUV` and `dma-buf zero-copy rendering
+  enabled`. 1080p/720p/480p H.264 all play; the user-facing smoothness line is **≤720p** (1080p still decodes but
+  costs an 8×8-tap downsample and shows no extra detail on a 480p panel).
 - **VPU experimental switch.** `src/tweaker/VpuUnlock.*` (context property `vpuUnlock`, switch under
   更多设置 → 系统微调 → 实验性功能) turns the VPU patch on and off from the UI: it backs the factory boot image up to
   `/userdisk/PenMods/boot_stock.img` once, rewrites `vpu_combo/status` **inside the DTB in the boot image**

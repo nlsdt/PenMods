@@ -15,7 +15,9 @@ MODE=${1:-release}
 ARCH=arm64-v8a
 PLAT=linux
 SRC_DIR="build/$PLAT/$ARCH/$MODE/qml/FFmpegPlayer"
-DST_DIR=/userdata/PenMods/qml/FFmpegPlayer
+# YDP03X 的 ExternalPlayer::hasEmbeddedPlayer() 检查 /userdisk/PenMods/qml/FFmpegPlayer，
+# Engine 的导入路径也包含 /userdisk；推到 /userdata 会导致页面回退到 mpv。
+DST_DIR=/userdisk/PenMods/qml/FFmpegPlayer
 
 if [ ! -f "$SRC_DIR/libffmpegplayerplugin.so" ]; then
     echo "找不到产物: $SRC_DIR/libffmpegplayerplugin.so"
@@ -37,5 +39,5 @@ adb shell "mv -f $DST_DIR/libffmpegplayerplugin.tmp.so $DST_DIR/libffmpegplayerp
 adb shell "ls -la $DST_DIR/"
 echo
 echo "==> 重启宿主进程以加载新插件"
-adb shell 'killall YoudaoDictPen'
+adb shell 'killall YoudaoDictPen 2>/dev/null; sleep 1; pidof YoudaoDictPen >/dev/null 2>&1 && kill -9 $(pidof YoudaoDictPen); true'
 echo "完成（guardian 会在几秒内重启应用）"

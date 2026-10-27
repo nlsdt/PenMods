@@ -2,12 +2,13 @@
 
 #include "chatbot/AttachmentManager.h"
 
-#include "chatbot/Backend.h"
+#include "chatbot/core/MessageData.h"
 
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QRegularExpression>
 #include <QSaveFile>
 
 namespace mod::chatbot {

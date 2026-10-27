@@ -231,7 +231,7 @@ PEN_HOOK(bool, license_verify) { return true; }
 
 #include "hitokoto/Backend.h"
 
-#include "chatbot/Backend.h"
+#include "chatbot/facade/ChatBot.h"
 
 #include "rime/Backend.h"
 
@@ -330,7 +330,7 @@ __attribute__((constructor)) static void BeforeMain() {
     // hitokoto
     INSTANCE(hitokoto::Hitokoto)
 
-    // chatbot
+    // chatbot（新栈 facade）
     INSTANCE(chatbot::ChatBot)
 
     // rime
