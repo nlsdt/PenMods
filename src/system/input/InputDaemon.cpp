@@ -17,6 +17,64 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 
+namespace {
+
+// 固件的 /etc/init.d/S99input-event-daemon 会按 pcba 把对应模板
+// `mount --bind` 到 /etc/input-event-daemon.conf，而这个挂载点是**只读**的
+// （实测 `echo >> /etc/input-event-daemon.conf` 报 Read-only file system）。
+// 于是写挂载点必然失败，QSaveFile 的 rename 更是直接 "Device or resource busy"，
+// 界面上表现为改完自动息屏弹出「无法保存息屏设置」。真正的可写目标是 bind 的源文件。
+//
+// 源文件必须**就地**覆盖（truncate + write），不能用 QSaveFile：rename 会换掉 inode，
+// 而 bind mount 仍指着旧 inode，改完挂载点看不到新内容（input-event-daemon 也就读不到）。
+struct WriteTarget {
+    std::string path;
+    bool        inPlace = false;
+};
+
+WriteTarget resolveWriteTarget(const std::string& path) {
+    WriteTarget target{path, false};
+
+    QFile mountinfo(QStringLiteral("/proc/self/mountinfo"));
+    if (!mountinfo.open(QIODevice::ReadOnly)) return target;
+
+    // procfs 的 st_size 是 0，atEnd() 一开始就是 true，不能用 readLine() 迭代。
+    const auto lines = QString::fromUtf8(mountinfo.readAll()).split(QLatin1Char('\n'));
+    const auto want  = QString::fromStdString(path);
+    for (const auto& line : lines) {
+        const auto fields = line.split(QLatin1Char(' '));
+        if (fields.size() < 5) continue;
+        // <id> <parent> <maj:min> <root> <mount point> <options> ... - <fs> <source> ...
+        const auto& root       = fields[3];
+        const auto& mountPoint = fields[4];
+        if (mountPoint == want) {
+            if (root.isEmpty() || root == QLatin1String("/")) continue;
+            target.path    = root.toStdString();
+            target.inPlace = true;
+            return target;
+        }
+        // 自己就是别的挂载点的源：同样不能 rename。
+        if (root == want) target.inPlace = true;
+    }
+    return target;
+}
+
+bool writeInPlace(const std::string& path, const QByteArray& content, const std::string& backup) {
+    QFile file(QString::fromStdString(path));
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+    if (file.write(content) == content.size() && file.flush()) return true;
+    file.close();
+    // 写坏了就把原内容写回去，别把 daemon 的配置留在半截状态。
+    if (!backup.empty()) {
+        QFile restore(QString::fromStdString(path));
+        if (restore.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            restore.write(backup.data(), static_cast<qint64>(backup.size()));
+    }
+    return false;
+}
+
+} // namespace
+
 namespace mod {
 
 InputDaemon::InputDaemon() : Logger("InputDaemon") {
@@ -95,17 +153,24 @@ bool InputDaemon::_resetConfig() {
             .toUtf8();
     // 配置没变就别重启：重启会丢厂商的暂停状态（SIGUSR1 + /tmp 标记）并清掉空闲状态，下次输入
     // 走 [Idle] reset 会把刚熄的屏幕点亮。但仍要确认进程活着，否则被 kill/OOM 后永久不再重启。
-    if (readFile(cfg.mPath.c_str()) == std::string(content.constData(), content.size()) &&
-        !exec("pidof input-event-daemon").empty()) {
+    const auto current = readFile(cfg.mPath.c_str());
+    if (current == std::string(content.constData(), content.size()) && !exec("pidof input-event-daemon").empty()) {
         info("配置无变化且 daemon 在跑，跳过 input-event-daemon 重启");
         return true;
     }
-    QSaveFile ofile(QString::fromStdString(cfg.mPath));
-    if (ofile.open(QIODevice::WriteOnly)) {
-        if (ofile.write(content) != content.size() || !ofile.commit()) return false;
+    const auto target  = resolveWriteTarget(cfg.mPath);
+    bool       written = false;
+    if (target.inPlace) {
+        written = writeInPlace(target.path, content, current);
     } else {
+        QSaveFile ofile(QString::fromStdString(cfg.mPath));
+        if (ofile.open(QIODevice::WriteOnly)) written = ofile.write(content) == content.size() && ofile.commit();
+    }
+    if (!written) {
+        error("写入 idle 配置失败: {} -> {}", cfg.mPath, target.path);
         return false;
     }
+    if (target.path != cfg.mPath) info("idle 配置写入 bind mount 源文件 {}", target.path);
     exec("killall input-event-daemon");
     exec("input-event-daemon");
     if (mPaused) pause();

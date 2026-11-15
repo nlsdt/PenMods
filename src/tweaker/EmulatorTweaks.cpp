@@ -160,10 +160,10 @@ PEN_HOOK(void*, _ZN13YRecordCenter18startRecordProcessEv, void* self) {
     return nullptr;
 }
 
-PEN_HOOK(void*, _ZN12YSoundCenter17startSoundProcessEv, void* self) {
-    spdlog::warn("BANNED start sound process");
-    return nullptr;
-}
+// 不要拦 startSoundProcess()：YSoundCenter 的 switchAutoPronType()/switchToMicroTTS()
+// 会直接对内部 QProcess 调 state()，进程被拦掉后指针是 null，YSettingManager 初始化阶段
+// 必然 SIGSEGV。模拟器里让它们照常启动 SoundPlayer 即可（没有声卡时进程会自己退出），
+// 播放相关调用下面已经逐个拦掉了。
 
 PEN_HOOK(uint32, _ZN12YSoundCenter4playERK7QStringS2_S2_i, void* a1, void* a2, void* a3, void* a4, void* a5) {
     return 0;

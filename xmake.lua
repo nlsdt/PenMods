@@ -28,6 +28,12 @@ if is_mode('debug') or get_config('force-debug-log') then
     add_defines('PL_DEBUG')
 end
 
+-- option('qemu') 里的 add_defines 只作用于 option 自身，不会注入 target，
+-- 所以必须在这里显式转发，否则 EmulatorTweaks.cpp 会被 #if PL_QEMU 整段裁掉。
+if has_config('qemu') then
+    add_defines('PL_QEMU')
+end
+
 if is_mode('release') then
     set_policy('build.optimization.lto', true)
 end

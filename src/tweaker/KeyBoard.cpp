@@ -97,8 +97,12 @@ PEN_HOOK(uint64, _ZN7YGlobal14showSpeechPageEv, uint64 self) {
 }
 
 static bool shouldBlockScan() {
-    bool inputPageShowing = PEN_CALL(bool, "_ZNK7YGlobal16inputPageShowingEv", void*)(mod::YPointer<YGlobal>::getInstance());
-    return inputPageShowing || mod::KeyBoard::getInstance().autoSendScan();
+    // 不要再调宿主的 YGlobal::inputPageShowing —— 那层宿主输入框状态由 PenMods 自己的
+    // keyBoard.inputPageShowing 维护（YInputPage.qml 打开/关闭时同步），而三代固件里根本没有
+    // _ZNK7YGlobal16inputPageShowingEv 这个符号：PEN_CALL 解析到 nullptr 后直接调用，
+    // 按一下扫描就跳到 0 地址崩溃（PC is at 0x0）。保留原语义，只换数据来源。
+    const auto& kb = mod::KeyBoard::getInstance();
+    return kb.inputPageShowing() || kb.autoSendScan();
 }
 
 PEN_HOOK(bool, _ZN11YSystemBase12onScanFinishERK7QStringi, uint64 self, QString const& content, ScanType scanType) {
