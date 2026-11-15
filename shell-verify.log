@@ -1,0 +1,11 @@
+=== id ===
+uid=0(root) gid=0(root) groups=0(root)
+=== uname ===
+Linux YoudaoDictionaryPen-203 4.4.159 #1 SMP Thu Aug 31 15:37:17 HKT 2023 aarch64 GNU/Linux
+=== uptime ===
+ 22:33pm  up   6:26,  0 users,  load average: 0.06, 0.00, 0.05
+=== YoudaoDictPen pid ===
+1060
+=== root check ===
+/bin/sh: getprop: not found
+/bin/sh: getprop: not found
