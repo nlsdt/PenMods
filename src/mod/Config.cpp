@@ -212,6 +212,20 @@ Config::Config() : Logger("Config") {
             {"math_render", {
                 {"enabled",     false},
                 {"server_path", ""}
+            }},
+            // 美元 / 百万 tokens。DeepSeek 官方价分峰谷（谷时是峰时的一半），
+            // 峰时是 UTC 周一至周五 01:00-04:00 与 06:00-10:00。用户可改。
+            {"pricing", {
+                {"deepseek-flash", {
+                    {"input", 0.15}, {"inputPeak", 0.3},
+                    {"output", 0.6},  {"outputPeak", 1.2},
+                    {"cacheRead", 0.003}, {"cacheReadPeak", 0.006}
+                }},
+                {"deepseek-v4-pro", {
+                    {"input", 0.66}, {"inputPeak", 1.32},
+                    {"output", 1.98}, {"outputPeak", 3.96},
+                    {"cacheRead", 0.022}, {"cacheReadPeak", 0.044}
+                }}
             }}
         }}
     };

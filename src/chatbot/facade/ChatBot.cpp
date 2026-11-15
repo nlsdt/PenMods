@@ -13,6 +13,7 @@
 #include "chatbot/model/ModelRegistry.h"
 #include "chatbot/model/PromptStore.h"
 #include "chatbot/session/SessionManager.h"
+#include "chatbot/tools/ReadTool.h"
 #include "chatbot/tools/ShellTool.h"
 #include "chatbot/tools/ToolRuntime.h"
 #include "chatbot/tools/WebSearchTool.h"
@@ -26,8 +27,10 @@
 #include <QQuickView>
 
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QDir>
 #include <QFile>
+#include <QImageReader>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -70,6 +73,21 @@ json toNlohmann(const QJsonObject& object) {
 QJsonObject toQtObject(const json& value) {
     if (!value.is_object()) return {};
     return QJsonDocument::fromJson(QByteArray::fromStdString(value.dump())).object();
+}
+
+// DeepSeek 的峰谷计费窗口，单位 UTC：周一至周五 01:00-04:00 与 06:00-10:00。
+bool isPeakHourUtc(const QDateTime& utc) {
+    const int dayOfWeek = utc.date().dayOfWeek(); // 1 = 周一
+    if (dayOfWeek > 5) return false;
+    const int minutes = utc.time().hour() * 60 + utc.time().minute();
+    return (minutes >= 1 * 60 && minutes < 4 * 60) || (minutes >= 6 * 60 && minutes < 10 * 60);
+}
+
+// 工具卡只显示一行：「运行命令 · <命令首行>」，太长就截断。
+QString toolLineLabel(const QString& raw, int maxChars = 60) {
+    QString line = raw.section(QLatin1Char('\n'), 0, 0).trimmed();
+    if (line.size() > maxChars) line = line.left(maxChars - 1) + QStringLiteral("…");
+    return line;
 }
 
 QJsonArray toQtArray(const json& value) {
@@ -122,6 +140,8 @@ struct ChatBot::Private {
     bool    mathEnabled   = false;
     QString mathServerPath;
 
+    QHash<QString, QString> toolCommands; // callId -> 命令/查询的首行摘要
+
     QString      responseMessageId;
     QString      responseSessionId;
     QVariantList responseToolStates;
@@ -129,11 +149,15 @@ struct ChatBot::Private {
     bool         cancelled = false;
     quint64      toolBatchGeneration = 0;
 
-    quint64 cacheSamples = 0;
-    quint64 totalInput   = 0;
-    quint64 totalCached  = 0;
-    quint64 lastInput    = 0;
-    quint64 lastCached   = 0;
+    // 单价后备表：ai.pricing[<modelId>] = {input, output, cacheRead}，单位美元/百万
+    // token。优先用模型 JSON 里从 {endpoint}/models 拉到的 price*，拉不到才用这张表。
+    QHash<QString, QJsonObject> priceTable;
+
+    // 缓存统计/金额全部跟着会话走（sessions 行的 tokens_* / cost），这里只缓存最近
+    // 一次查询结果，免得 QML 绑定在每次求值时都打一次 SQL。
+    mutable UsageStats statsCache;
+    mutable qint64     statsCacheAt = 0;
+    bool               statsDirty   = true;
 
     json readAi() const;
     void persistAi(const json& ai);
@@ -164,6 +188,7 @@ struct ChatBot::Private {
     void           resetRequestState();
 
     QJsonObject shellDefinition() const;
+    QJsonObject readDefinition() const;
     QJsonObject searchDefinition() const;
 };
 
@@ -207,6 +232,14 @@ void ChatBot::Private::loadConfig(bool emitSignals) {
         persistPrompts();
     }
     if (!prompts.activeContent().isEmpty()) defaultPrompt = prompts.activeContent();
+
+    priceTable.clear();
+    if (ai.contains("pricing") && ai["pricing"].is_object()) {
+        const QJsonObject table = toQtObject(ai["pricing"]);
+        for (auto it = table.begin(); it != table.end(); ++it) {
+            if (it.value().isObject()) priceTable.insert(it.key(), it.value().toObject());
+        }
+    }
 
     QJsonObject searchSection;
     if (ai.contains("search") && ai["search"].is_object()) searchSection = toQtObject(ai["search"]);
@@ -426,11 +459,40 @@ QJsonObject ChatBot::Private::searchDefinition() const {
     };
 }
 
+QJsonObject ChatBot::Private::readDefinition() const {
+    QJsonObject parameters{
+        {QStringLiteral("type"), QStringLiteral("object")},
+        {QStringLiteral("properties"),
+         QJsonObject{
+             {QStringLiteral("path"),
+              QJsonObject{{QStringLiteral("type"), QStringLiteral("string")},
+                          {QStringLiteral("description"), QStringLiteral("要读取的文本文件或图片路径")}}},
+             {QStringLiteral("offset"),
+              QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")},
+                          {QStringLiteral("description"), QStringLiteral("从第几行开始（1-based，默认 1）")}}},
+             {QStringLiteral("limit"),
+              QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")},
+                          {QStringLiteral("description"), QStringLiteral("最多读取多少行（默认上限 2000）")}}},
+         }},
+        {QStringLiteral("required"), QJsonArray{QStringLiteral("path")}},
+    };
+    return QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("function")},
+        {QStringLiteral("function"),
+         QJsonObject{
+             {QStringLiteral("name"), QStringLiteral("read")},
+             {QStringLiteral("description"),
+              QStringLiteral("读取设备上的文本文件（返回带行号内容）或图片（自动附加到对话，供视觉模型查看）")},
+             {QStringLiteral("parameters"), parameters}}},
+    };
+}
+
 QJsonArray ChatBot::Private::toolDefinitions() const {
     QJsonArray tools;
     const ModelCapabilities caps = models.active().capabilities;
     if (caps.toolCall && search.available(true, apiKey)) tools.append(searchDefinition());
     if (caps.toolCall && shellConfig.enabled) tools.append(shellDefinition());
+    if (caps.toolCall) tools.append(readDefinition());
     return tools;
 }
 
@@ -514,16 +576,58 @@ void ChatBot::Private::dispatchTools(const QString& toolCallsJson) {
         if (call.name == QLatin1String("shell_exec")) {
             const QString command = args.value(QStringLiteral("command")).toString();
             toolBatch.markRunning(call.id);
-            updateToolState(call.id, QStringLiteral("running"), QStringLiteral("等待审批"));
+            toolCommands.insert(call.id, toolLineLabel(command));
+            updateToolState(
+                call.id,
+                QStringLiteral("running"),
+                QStringLiteral("运行命令 · ") + toolCommands.value(call.id)
+            );
             const auto rejection = shellTool.request(call.id, command);
             if (rejection) {
                 updateToolState(call.id, QStringLiteral("error"), *rejection, *rejection);
                 toolBatch.fail(call.id, *rejection);
             }
+        } else if (call.name == QLatin1String("read")) {
+            const QString path   = args.value(QStringLiteral("path")).toString();
+            const int     offset = args.value(QStringLiteral("offset")).toInt();
+            const int     limit  = args.value(QStringLiteral("limit")).toInt();
+            const QString name   = toolLineLabel(QFileInfo(path).fileName().isEmpty() ? path
+                                                                                    : QFileInfo(path).fileName());
+            toolBatch.markRunning(call.id);
+            toolCommands.insert(call.id, name);
+            updateToolState(call.id, QStringLiteral("running"), QStringLiteral("读取 · ") + name);
+
+            const ReadResult read = ReadTool::readFile(path, offset, limit);
+            if (!read.ok) {
+                updateToolState(call.id, QStringLiteral("error"), QStringLiteral("读取失败 · ") + name, read.error);
+                toolBatch.fail(call.id, read.error);
+            } else if (read.isImage) {
+                // 图片只作为该 trace 行的展开内容显示（QML 按路径加载），不再往会话里
+                // 插一条 user 消息，避免干扰对话与协议顺序。
+                const QSize imageSize = QImageReader(path).size();
+                const QString summary =
+                    QStringLiteral("已读取图片：%1（%2，%3x%4，%5 字节）")
+                        .arg(path, read.mimeType)
+                        .arg(imageSize.width())
+                        .arg(imageSize.height())
+                        .arg(read.size);
+                toolCommands.insert(call.id, QStringLiteral("读取图片 · ") + name);
+                updateToolState(call.id, QStringLiteral("done"), QStringLiteral("读取图片 · ") + name, summary);
+                toolBatch.resolve(call.id, summary);
+            } else {
+                toolCommands.insert(call.id, QStringLiteral("读取 · ") + name);
+                updateToolState(call.id, QStringLiteral("done"), QStringLiteral("读取 · ") + name, read.text);
+                toolBatch.resolve(call.id, read.text);
+            }
         } else if (call.name == QLatin1String("web_search")) {
             const QString query = args.value(QStringLiteral("query")).toString();
             toolBatch.markRunning(call.id);
-            updateToolState(call.id, QStringLiteral("running"), QStringLiteral("正在搜索"));
+            toolCommands.insert(call.id, toolLineLabel(query));
+            updateToolState(
+                call.id,
+                QStringLiteral("running"),
+                QStringLiteral("搜索 · ") + toolCommands.value(call.id)
+            );
             const auto rejection = searchTool.start(call.id, query, apiKey);
             if (rejection) {
                 updateToolState(call.id, QStringLiteral("error"), *rejection, *rejection);
@@ -577,13 +681,36 @@ void ChatBot::Private::onFinished(const ChatResult& result) {
         && (result.usage.inputTokens > 0 || result.usage.outputTokens > 0
             || result.usage.reasoningTokens > 0 || result.usage.cacheReadTokens > 0
             || result.usage.cacheWriteTokens > 0)) {
-        UsageCounters counters;
+        const ActiveModel model = models.active();
+        UsageCounters     counters;
         counters.input      = result.usage.inputTokens;
         counters.output     = result.usage.outputTokens;
         counters.reasoning  = result.usage.reasoningTokens;
         counters.cacheRead  = result.usage.cacheReadTokens;
         counters.cacheWrite = result.usage.cacheWriteTokens;
-        (void)sessions->recordUsage(usageSession, counters);
+        // input 已含缓存命中部分（见 parseUsageObject），命中部分按缓存单价算，
+        // 没配缓存单价时退回输入单价。
+        // DeepSeek 官方价分峰谷：谷时是峰时的一半，峰时是 UTC 周一至周五
+        // 01:00-04:00 与 06:00-10:00（不含中国大陆节假日，这里判断不了）。
+        const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+        const bool      peak   = isPeakHourUtc(nowUtc);
+        double          priceInput  = model.priceInput;
+        double          priceOutput = model.priceOutput;
+        double          priceCache  = model.priceCacheRead;
+        if (priceInput <= 0 && priceOutput <= 0) {
+            const auto fallback = priceTable.value(model.modelId);
+            priceInput  = fallback.value(peak ? "inputPeak" : "input").toDouble();
+            priceOutput = fallback.value(peak ? "outputPeak" : "output").toDouble();
+            priceCache  = fallback.value(peak ? "cacheReadPeak" : "cacheRead").toDouble();
+        }
+        if (priceCache <= 0) priceCache = priceInput;
+        const double uncached = std::max<std::int64_t>(0, counters.input - counters.cacheRead);
+        counters.cost = static_cast<double>(uncached) * priceInput / 1e6
+                        + static_cast<double>(counters.cacheRead) * priceCache / 1e6
+                        + static_cast<double>(counters.output) * priceOutput / 1e6;
+        (void)sessions->addUsage(usageSession, counters);
+        statsDirty = true;
+        emit q->apiCacheStatsChanged();
     }
 
     if (cancelled) {
@@ -694,16 +821,8 @@ ChatBot::ChatBot() : Logger("ChatBot"), d(std::make_shared<Private>()) {
         },
         [this](const QString& text) { emit streamChunk(text); },
         [this](const QString& text) { emit reasoningChunk(text); },
-        [this](const UsageDelta& usage) {
-            if (usage.inputTokens > 0) {
-                d->lastInput  = static_cast<quint64>(usage.inputTokens);
-                d->lastCached = static_cast<quint64>(usage.cacheReadTokens);
-                d->totalInput += d->lastInput;
-                d->totalCached += d->lastCached;
-                ++d->cacheSamples;
-                emit apiCacheStatsChanged();
-            }
-        },
+        // 统计只在 onFinished() 落库后刷新（见 recordUsage），流式增量不重复记账。
+        [](const UsageDelta&) {},
         {}, // toolCalls: emitted by dispatchTools() after the assistant message exists
         [this](const QString& toolName, const QString& status) {
             const bool done = status != QLatin1String("running");
@@ -715,19 +834,27 @@ ChatBot::ChatBot() : Logger("ChatBot"), d(std::make_shared<Private>()) {
     d->shellTool.setCallbacks(ShellTool::Callbacks{
         [this](const QString& callId, const QString& command) { emit shellCommandPending(callId, command); },
         [this](const QString& callId, const QString& command) {
-            d->updateToolState(callId, QStringLiteral("running"), QStringLiteral("执行中"));
+            d->toolCommands.insert(callId, toolLineLabel(command));
+            d->updateToolState(
+                callId,
+                QStringLiteral("running"),
+                QStringLiteral("运行命令 · ") + d->toolCommands.value(callId)
+            );
             emit shellCommandStarted(callId, command);
         },
         [this](const QString& callId, bool success, const QString& summary, const QString& result) {
+            const QString label = d->toolCommands.value(callId);
             d->updateToolState(
                 callId,
                 success ? QStringLiteral("done") : QStringLiteral("error"),
-                summary,
+                label.isEmpty() ? summary : (QStringLiteral("运行命令 · ") + label),
                 result);
             if (success) {
                 d->toolBatch.resolve(callId, result);
             } else {
-                d->toolBatch.fail(callId, summary.isEmpty() ? result : summary);
+                // 退出码非 0 时也要把完整结果（stdout/stderr + 退出码）交给模型：
+                // 只回一句 "退出码: 1" 会把命令真正的报错吞掉，模型无从跟进。
+                d->toolBatch.fail(callId, result.isEmpty() ? summary : result);
             }
             emit shellCommandFinished(callId, success, summary, result);
             d->tryFlushTools();
@@ -741,15 +868,18 @@ ChatBot::ChatBot() : Logger("ChatBot"), d(std::make_shared<Private>()) {
             emit tavilySearchStarted(callId, query);
         },
         [this](const QString& callId, bool success, const QString& summary, const QString& result) {
+            const QString label = d->toolCommands.value(callId);
             d->updateToolState(
                 callId,
                 success ? QStringLiteral("done") : QStringLiteral("error"),
-                summary,
+                label.isEmpty() ? summary : (QStringLiteral("运行命令 · ") + label),
                 result);
             if (success) {
                 d->toolBatch.resolve(callId, result);
             } else {
-                d->toolBatch.fail(callId, summary.isEmpty() ? result : summary);
+                // 退出码非 0 时也要把完整结果（stdout/stderr + 退出码）交给模型：
+                // 只回一句 "退出码: 1" 会把命令真正的报错吞掉，模型无从跟进。
+                d->toolBatch.fail(callId, result.isEmpty() ? summary : result);
             }
             emit webSearchFinished(callId, success, summary, result);
             emit tavilySearchFinished(callId, success, summary, result);
@@ -779,7 +909,17 @@ QString ChatBot::responseMessageId() const { return d->responseMessageId; }
 QString ChatBot::getCurrentSessionId() { return d->currentSessionId(); }
 bool    ChatBot::isAvailable() { return !d->apiKey.isEmpty(); }
 
-QVariantList ChatBot::getMessages() const { return d->messagesVariant(); }
+QVariantList ChatBot::getMessages() const {
+    // 性能测量：这个属性每次被 QML 读取都会重建整份列表，大会话下是最重的一步。
+    QElapsedTimer timer;
+    timer.start();
+    QVariantList list = d->messagesVariant();
+    const qint64 elapsed = timer.elapsed();
+    if (elapsed >= 5 || list.size() >= 50) {
+        spdlog::info("getMessages: {} 条消息, {} ms", list.size(), elapsed);
+    }
+    return list;
+}
 
 QVariantList ChatBot::getToolStates() const {
     QVariantList states;
@@ -797,20 +937,30 @@ QVariantList ChatBot::getToolStates() const {
 }
 
 QVariantMap ChatBot::getApiCacheStats() const {
-    const double totalRate = d->totalInput > 0
-                                 ? 100.0 * static_cast<double>(d->totalCached) / static_cast<double>(d->totalInput)
-                                 : 0.0;
-    const double lastRate = d->lastInput > 0
-                                ? 100.0 * static_cast<double>(d->lastCached) / static_cast<double>(d->lastInput)
-                                : 0.0;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (d->statsDirty || !d->sessions || now - d->statsCacheAt > 500) {
+        d->statsCacheAt = now;
+        d->statsCache   = {};
+        if (d->sessions) {
+            const QString sessionId = d->currentSessionId();
+            if (!sessionId.isEmpty()) {
+                auto stored = d->sessions->sessionUsage(sessionId);
+                if (stored) {
+                    d->statsCache = *stored;
+                    d->statsDirty = false;
+                }
+            }
+        }
+    }
+
+    const auto& stats = d->statsCache;
     return {
-        {"sampleCount", QVariant::fromValue<qulonglong>(d->cacheSamples)},
-        {"totalInputTokens", QVariant::fromValue<qulonglong>(d->totalInput)},
-        {"totalCachedTokens", QVariant::fromValue<qulonglong>(d->totalCached)},
-        {"totalRate", totalRate},
-        {"lastInputTokens", QVariant::fromValue<qulonglong>(d->lastInput)},
-        {"lastCachedTokens", QVariant::fromValue<qulonglong>(d->lastCached)},
-        {"lastRate", lastRate},
+        {"inputTokens", QVariant::fromValue<qulonglong>(static_cast<qulonglong>(stats.input))},
+        {"outputTokens", QVariant::fromValue<qulonglong>(static_cast<qulonglong>(stats.output))},
+        {"cachedTokens", QVariant::fromValue<qulonglong>(static_cast<qulonglong>(stats.cacheRead))},
+        {"cacheWriteTokens", QVariant::fromValue<qulonglong>(static_cast<qulonglong>(stats.cacheWrite))},
+        {"hitRate", stats.hitRate()},
+        {"cost", stats.cost},
     };
 }
 
@@ -994,9 +1144,72 @@ void ChatBot::cancelRequest() {
     emit streamEnd();
 }
 
-void ChatBot::resetApiCacheStats() {
-    d->cacheSamples = d->totalInput = d->totalCached = d->lastInput = d->lastCached = 0;
-    emit apiCacheStatsChanged();
+void ChatBot::reportPerf(const QString& name, int ms, int rows) {
+    spdlog::info("[perf] {} {}ms rows={}", name.toStdString(), ms, rows);
+}
+
+void ChatBot::refreshModelPrices() {
+    const ActiveModel model = d->models.active();
+    if (!d->network || model.endpoint.isEmpty()) return;
+
+    // endpoint 通常是 .../chat/completions 或 .../responses，模型列表在同一 base 下。
+    QString base = model.endpoint;
+    for (const QString& suffix : {QStringLiteral("/chat/completions"), QStringLiteral("/responses")}) {
+        if (base.endsWith(suffix)) {
+            base.chop(suffix.size());
+            break;
+        }
+    }
+    while (base.endsWith(QLatin1Char('/'))) base.chop(1);
+
+    QNetworkRequest request{QUrl(base + QStringLiteral("/models"))};
+    request.setRawHeader("Accept", "application/json");
+    if (!model.apiKey.isEmpty())
+        request.setRawHeader("Authorization", "Bearer " + model.apiKey.toUtf8());
+
+    QNetworkReply* reply = d->network->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, model]() {
+        const QByteArray body = reply->readAll();
+        reply->deleteLater();
+        // 拉不到不算错误：多数官方端点（如 DeepSeek）不返回 pricing，金额走
+        // config 里的 ai.pricing 表。
+        if (reply->error() != QNetworkReply::NoError) return;
+
+        QJsonParseError parseError{};
+        const QJsonDocument doc = QJsonDocument::fromJson(body, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) return;
+        const QJsonArray data = doc.object().value(QStringLiteral("data")).toArray();
+
+        // OpenRouter 风格：pricing.prompt / pricing.completion，单位是「美元 / token」，
+        // 存成「美元 / 百万 token」以便展示。只认 id 与当前模型 modelId 一致的那条。
+        for (const QJsonValue& item : data) {
+            const QJsonObject entry = item.toObject();
+            if (entry.value(QStringLiteral("id")).toString() != model.modelId) continue;
+            const QJsonObject pricing = entry.value(QStringLiteral("pricing")).toObject();
+            if (pricing.isEmpty()) continue;
+            // 有的服务端把价格写成字符串 "0.000003"，有的写成数字，两种都接受。
+            const auto priceOf = [](const QJsonValue& value) {
+                return value.isString() ? value.toString().toDouble() : value.toDouble();
+            };
+            const double prompt     = priceOf(pricing.value(QStringLiteral("prompt")));
+            const double completion = priceOf(pricing.value(QStringLiteral("completion")));
+            if (prompt <= 0 && completion <= 0) continue;
+
+            QJsonObject updated = d->models.activeModelJson();
+            updated.insert(QStringLiteral("priceInput"), prompt * 1e6);
+            updated.insert(QStringLiteral("priceOutput"), completion * 1e6);
+            // 缓存命中价按输入价计，OpenRouter 没有单独的缓存读字段。
+            updated.insert(QStringLiteral("priceCacheRead"), prompt * 1e6);
+            (void)d->models.upsert(updated);
+            d->persistModels();
+            d->applyActiveModel(true);
+            d->statsDirty = true;
+            emit apiCacheStatsChanged();
+            emit apiCacheStatsRefreshed();
+            return;
+        }
+        emit apiCacheStatsRefreshed();
+    });
 }
 
 void ChatBot::submitToolResult(const QString& toolCallId, const QString& toolName, const QString& result) {
@@ -1034,7 +1247,7 @@ QString ChatBot::getSessions() {
                 {QStringLiteral("title"), it->title},
                 {QStringLiteral("createdAt"), it->createdAt},
                 {QStringLiteral("updatedAt"), it->updatedAt},
-                {QStringLiteral("messageCount"), it->messages.size()},
+                {QStringLiteral("messageCount"), it->messageCount},
             });
         }
     }
@@ -1053,6 +1266,9 @@ bool ChatBot::switchSession(const QString& sessionId) {
     if (!switched) return false;
     d->responseToolStates.clear();
     emit messagesChanged();
+    // 统计跟随会话：切过去之后立刻刷新命中率/金额，别还挂着上一会话的数字。
+    d->statsDirty = true;
+    emit apiCacheStatsChanged();
     emit sessionSwitched(sessionId);
     return true;
 }

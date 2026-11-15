@@ -207,6 +207,9 @@ ActiveModel ModelRegistry::active() const {
     result.capabilities              = capabilitiesOf(model);
     result.proxyVisionModelId        = model.value(QStringLiteral("proxyVisionModelId")).toString();
     result.proxyVisionPrompt         = model.value(QStringLiteral("proxyVisionPrompt")).toString();
+    result.priceInput                = model.value(QStringLiteral("priceInput")).toDouble();
+    result.priceOutput               = model.value(QStringLiteral("priceOutput")).toDouble();
+    result.priceCacheRead            = model.value(QStringLiteral("priceCacheRead")).toDouble();
     return result;
 }
 

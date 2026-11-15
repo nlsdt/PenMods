@@ -52,6 +52,9 @@ public:
     // deleted session cannot resurrect it.
     [[nodiscard]] Result<void> addUsage(const std::string& sessionId, const UsageCounters& usage);
 
+    // 会话的用量账目（tokens_* + cost）。统计跟随会话，不另设全局计数器。
+    [[nodiscard]] Result<UsageStats> sessionUsage(const std::string& sessionId) const;
+
     [[nodiscard]] Result<std::vector<SessionEvent>> appendEvents(
         const std::string& sessionId,
         const std::vector<NewEvent>& events,

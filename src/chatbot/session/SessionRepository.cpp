@@ -170,29 +170,12 @@ Result<LoadedSessions> SessionRepository::load() const {
     loaded.sessions.reserve(metas->size());
 
     for (const auto& meta : *metas) {
-        auto events = m_store->loadEvents(meta.id);
-        if (!events) {
-            return std::unexpected(events.error());
-        }
-
         StoredSession session;
-        session.id        = QString::fromStdString(meta.id);
-        session.title     = QString::fromStdString(meta.title);
-        session.createdAt = msToIso(meta.createdAt);
-        session.updatedAt = msToIso(meta.updatedAt);
-
-        for (const auto& event : *events) {
-            if (!isMessageKind(event.kind)) continue;
-            const json parsed = json::parse(event.data, nullptr, false);
-            if (parsed.is_discarded() || !parsed.is_object()) {
-                continue;
-            }
-            MessageData msg = messageDataFromJson(parsed);
-            if (msg.role.isEmpty()) {
-                continue;
-            }
-            session.messages.append(std::move(msg));
-        }
+        session.id           = QString::fromStdString(meta.id);
+        session.title        = QString::fromStdString(meta.title);
+        session.createdAt    = msToIso(meta.createdAt);
+        session.updatedAt    = msToIso(meta.updatedAt);
+        session.messageCount = static_cast<int>(meta.messageCount);
         loaded.sessions.push_back(std::move(session));
     }
 
@@ -201,9 +184,36 @@ Result<LoadedSessions> SessionRepository::load() const {
         return std::unexpected(active.error());
     }
     if (active->has_value()) {
-        loaded.activeSessionId = QString::fromStdString(active->value());
+        loaded.activeSessionId = QString::fromStdString(**active);
     }
     return loaded;
+}
+
+Result<QVector<MessageData>> SessionRepository::loadMessages(const QString& sessionId) const {
+    if (sessionId.isEmpty()) {
+        return fail(ErrorCode::InvalidArgument, "session id is empty");
+    }
+
+    auto events = m_store->loadEvents(sessionId.toStdString());
+    if (!events) {
+        return std::unexpected(events.error());
+    }
+
+    QVector<MessageData> messages;
+    messages.reserve(static_cast<int>(events->size()));
+    for (const auto& event : *events) {
+        if (!isMessageKind(event.kind)) continue;
+        const json parsed = json::parse(event.data, nullptr, false);
+        if (parsed.is_discarded() || !parsed.is_object()) {
+            continue;
+        }
+        MessageData msg = messageDataFromJson(parsed);
+        if (msg.role.isEmpty()) {
+            continue;
+        }
+        messages.append(std::move(msg));
+    }
+    return messages;
 }
 
 Result<void> SessionRepository::createSession(const QString& id, const QString& title, qint64 nowMs) {
@@ -358,6 +368,13 @@ Result<void> SessionRepository::addUsage(const QString& sessionId, const UsageCo
         return fail(ErrorCode::InvalidArgument, "session id is empty");
     }
     return m_store->addUsage(sessionId.toStdString(), usage);
+}
+
+Result<UsageStats> SessionRepository::sessionUsage(const QString& sessionId) const {
+    if (sessionId.isEmpty()) {
+        return fail(ErrorCode::InvalidArgument, "session id is empty");
+    }
+    return m_store->sessionUsage(sessionId.toStdString());
 }
 
 } // namespace mod::chatbot

@@ -48,6 +48,11 @@ Result<std::unique_ptr<SessionManager>> SessionManager::open(const QString& dbPa
     if (!ensured) {
         return std::unexpected(ensured.error());
     }
+    // Only the conversation the user is looking at is decoded at startup.
+    auto active = manager->ensureLoaded(manager->m_activeSessionId);
+    if (!active) {
+        return std::unexpected(active.error());
+    }
     return manager;
 }
 
@@ -74,9 +79,34 @@ const StoredSession* SessionManager::session(const QString& id) const {
     return it == m_sessions.constEnd() ? nullptr : &it.value();
 }
 
-QVector<MessageData> SessionManager::messages(const QString& id) const {
-    const StoredSession* stored = session(id);
-    return stored ? stored->messages : QVector<MessageData>{};
+bool SessionManager::isLoaded(const QString& id) const {
+    return m_loaded.contains(id);
+}
+
+Result<void> SessionManager::ensureLoaded(const QString& id) {
+    if (m_loaded.contains(id)) return {};
+
+    const auto it = m_sessions.find(id);
+    if (it == m_sessions.end()) {
+        return fail(ErrorCode::NotFound, "session not found: " + id.toStdString());
+    }
+
+    auto messages = m_repo->loadMessages(id);
+    if (!messages) {
+        return std::unexpected(messages.error());
+    }
+    it->messages     = std::move(*messages);
+    it->messageCount = it->messages.size();
+    m_loaded.insert(id);
+    return {};
+}
+
+QVector<MessageData> SessionManager::messages(const QString& id) {
+    if (!ensureLoaded(id)) {
+        return {};
+    }
+    const auto it = m_sessions.constFind(id);
+    return it == m_sessions.constEnd() ? QVector<MessageData>{} : it->messages;
 }
 
 Result<QString> SessionManager::createSession(const QString& title) {
@@ -99,6 +129,7 @@ Result<QString> SessionManager::createSession(const QString& title) {
 
     const QString id = session.id;
     m_sessions.insert(id, std::move(session));
+    m_loaded.insert(id);
     m_activeSessionId = id;
     return id;
 }
@@ -116,6 +147,7 @@ Result<void> SessionManager::deleteSession(const QString& id) {
         return removed;
     }
     m_sessions.remove(id);
+    m_loaded.remove(id);
 
     if (m_activeSessionId == id) {
         m_activeSessionId = m_sessions.firstKey();
@@ -148,11 +180,25 @@ Result<void> SessionManager::switchSession(const QString& id) {
     }
     if (m_activeSessionId == id) return {};
 
+    auto loaded = ensureLoaded(id);
+    if (!loaded) {
+        return loaded;
+    }
+
     auto stored = m_repo->setActiveSession(id);
     if (!stored) {
         return stored;
     }
     m_activeSessionId = id;
+
+    // Free every conversation except the one just selected; switching back
+    // re-decodes it from the event log.
+    for (auto it = m_sessions.begin(); it != m_sessions.end(); ++it) {
+        if (it.key() == id || !m_loaded.contains(it.key())) continue;
+        it->messages.clear();
+        it->messages.squeeze();
+        m_loaded.remove(it.key());
+    }
     return {};
 }
 
@@ -160,6 +206,11 @@ Result<void> SessionManager::appendMessage(const QString& sessionId, const Messa
     const auto it = m_sessions.find(sessionId);
     if (it == m_sessions.end()) {
         return fail(ErrorCode::NotFound, "session not found: " + sessionId.toStdString());
+    }
+
+    auto loaded = ensureLoaded(sessionId);
+    if (!loaded) {
+        return loaded;
     }
 
     MessageData stored = message;
@@ -173,7 +224,8 @@ Result<void> SessionManager::appendMessage(const QString& sessionId, const Messa
     }
 
     it->messages.append(stored);
-    it->updatedAt = nowIso();
+    it->messageCount = it->messages.size();
+    it->updatedAt    = nowIso();
     return {};
 }
 
@@ -184,6 +236,11 @@ Result<void> SessionManager::updateMessage(
     const auto it = m_sessions.find(sessionId);
     if (it == m_sessions.end()) {
         return fail(ErrorCode::NotFound, "session not found: " + sessionId.toStdString());
+    }
+
+    auto loaded = ensureLoaded(sessionId);
+    if (!loaded) {
+        return loaded;
     }
 
     int index = -1;
@@ -216,6 +273,10 @@ Result<void> SessionManager::replaceTail(
     if (it == m_sessions.end()) {
         return fail(ErrorCode::NotFound, "session not found: " + sessionId.toStdString());
     }
+    auto loaded = ensureLoaded(sessionId);
+    if (!loaded) {
+        return loaded;
+    }
     if (keepCount < 0 || keepCount > it->messages.size()) {
         return fail(ErrorCode::InvalidArgument, "keepCount out of range");
     }
@@ -228,8 +289,9 @@ Result<void> SessionManager::replaceTail(
         return synced;
     }
 
-    it->messages  = std::move(next);
-    it->updatedAt = nowIso();
+    it->messages     = std::move(next);
+    it->messageCount = it->messages.size();
+    it->updatedAt    = nowIso();
     return {};
 }
 
@@ -239,20 +301,30 @@ Result<void> SessionManager::clearMessages(const QString& sessionId) {
         return fail(ErrorCode::NotFound, "session not found: " + sessionId.toStdString());
     }
 
+    auto loaded = ensureLoaded(sessionId);
+    if (!loaded) {
+        return loaded;
+    }
+
     auto cleared = m_repo->clearMessages(sessionId);
     if (!cleared) {
         return cleared;
     }
     it->messages.clear();
+    it->messageCount = 0;
     it->updatedAt = nowIso();
     return {};
 }
 
-Result<void> SessionManager::recordUsage(const QString& sessionId, const UsageCounters& usage) {
+Result<void> SessionManager::addUsage(const QString& sessionId, const UsageCounters& usage) {
     if (!m_sessions.contains(sessionId)) {
         return fail(ErrorCode::NotFound, "session not found: " + sessionId.toStdString());
     }
     return m_repo->addUsage(sessionId, usage);
+}
+
+Result<UsageStats> SessionManager::sessionUsage(const QString& sessionId) const {
+    return m_repo->sessionUsage(sessionId);
 }
 
 } // namespace mod::chatbot

@@ -41,6 +41,11 @@ struct ActiveModel {
     ModelCapabilities capabilities;
     QString           proxyVisionModelId;
     QString           proxyVisionPrompt;
+    // 元 / 百万 tokens（输入、输出、缓存命中）。0 表示未配置，金额统计按 0 计。
+    // 缓存命中单价缺省时按输入单价算，与大多数厂商一致。
+    double            priceInput = 0;
+    double            priceOutput = 0;
+    double            priceCacheRead = 0;
 };
 
 // In-memory model list + normalization rules migrated from the old addModel().

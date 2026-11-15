@@ -8,6 +8,7 @@
 
 #include <QHash>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QTimer>
 
 namespace mod::chatbot {
@@ -80,8 +81,28 @@ void ShellTool::Private::start(const QString& callId, const QString& command) {
     auto active       = std::make_shared<Active>();
     active->command   = command;
     active->process   = std::make_unique<QProcess>();
-    active->process->setProgram(QStringLiteral("/bin/sh"));
-    active->process->setArguments({QStringLiteral("-c"), command});
+    // runDictPen starts the host under `stdbuf`, which exports a glibc-only
+    // LD_PRELOAD. musl binaries (the sudo shim) then die with
+    // "Error relocating libstdbuf.so: __fprintf_chk: symbol not found", and the
+    // tool reports a bare exit code 127. Loader variables never belong in a
+    // tool's environment.
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.remove(QStringLiteral("LD_PRELOAD"));
+    env.remove(QStringLiteral("LD_LIBRARY_PATH"));
+    active->process->setProcessEnvironment(env);
+
+    const QString shellCommand = config.wrapCommand(command);
+    const QString runAs        = config.runAs.trimmed();
+    if (runAs.isEmpty() || runAs == QLatin1String("root") || runAs == QLatin1String("0")) {
+        active->process->setProgram(config.shellProgram());
+        active->process->setArguments({QStringLiteral("-c"), shellCommand});
+    } else {
+        // Drop privileges through the setuid shim, then source the prelude and
+        // run the command as that user. `sudo` inside the command still works.
+        active->process->setProgram(QStringLiteral("/usr/bin/sudo"));
+        active->process->setArguments({QStringLiteral("-u"), runAs, config.shellProgram(),
+                                       QStringLiteral("-c"), shellCommand});
+    }
     active->process->setProcessChannelMode(QProcess::SeparateChannels);
 
     QProcess* process = active->process.get();

@@ -29,6 +29,15 @@ struct ShellConfig {
     bool        enabled        = false;
     int         timeoutMs      = 10000;
     int         maxOutputBytes = 4096;
+    // Shell used to run commands. Empty means /bin/bash. Point it at another shell, a
+    // wrapper, or a restricted shell without touching the code.
+    QString     program;
+    // Run commands as this user. Empty or "root" keeps the inherited identity;
+    // anything else goes through the setuid sudo shim (`sudo -u <user>`).
+    QString     runAs;
+    // Optional script sourced (`.` builtin) before every command; a script that
+    // cannot be sourced aborts the command with exit code 125.
+    QString     sourceScript;
     QStringList blocklist;
 
     [[nodiscard]] static ShellConfig defaultConfig();
@@ -39,6 +48,12 @@ struct ShellConfig {
     // UTF-8-safe cut, appends a marker when anything was dropped.
     [[nodiscard]] QString truncate(const QString& output) const { return truncate(output, maxOutputBytes); }
     [[nodiscard]] QString truncate(const QString& output, int maxBytes) const;
+
+    // Configured program, falling back to /bin/bash.
+    [[nodiscard]] QString shellProgram() const;
+    // The string handed to `<program> -c`: the user command wrapped in a source
+    // prelude when sourceScript is set. Quoted so paths with spaces survive.
+    [[nodiscard]] QString wrapCommand(const QString& command) const;
 };
 
 enum class ToolState {

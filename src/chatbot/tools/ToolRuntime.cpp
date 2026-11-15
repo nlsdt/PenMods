@@ -50,6 +50,7 @@ QVector<ToolCallSpec> parseToolCalls(const QString& toolCallsJson) {
 
 ShellConfig ShellConfig::defaultConfig() {
     ShellConfig config;
+    config.program = QStringLiteral("/bin/bash");
     config.blocklist = QStringList{
         QStringLiteral("rm -rf /"),
         QStringLiteral("rm -rf /*"),
@@ -76,6 +77,11 @@ ShellConfig ShellConfig::fromJson(const QJsonObject& object) {
     config.maxOutputBytes =
         object.value(QStringLiteral("max_output_bytes")).toInt(config.maxOutputBytes);
 
+    const QString program = object.value(QStringLiteral("program")).toString().trimmed();
+    if (!program.isEmpty()) config.program = program;
+    config.runAs        = object.value(QStringLiteral("run_as")).toString().trimmed();
+    config.sourceScript = object.value(QStringLiteral("source_script")).toString().trimmed();
+
     if (object.value(QStringLiteral("blocklist")).isArray()) {
         config.blocklist.clear();
         for (const auto& value : object.value(QStringLiteral("blocklist")).toArray()) {
@@ -92,6 +98,9 @@ QJsonObject ShellConfig::toJson() const {
         {QStringLiteral("enabled"), enabled},
         {QStringLiteral("timeout_ms"), timeoutMs},
         {QStringLiteral("max_output_bytes"), maxOutputBytes},
+        {QStringLiteral("program"), program},
+        {QStringLiteral("run_as"), runAs},
+        {QStringLiteral("source_script"), sourceScript},
         {QStringLiteral("blocklist"), list},
     };
 }
@@ -122,6 +131,22 @@ QString ShellConfig::truncate(const QString& output, int maxBytes) const {
     else if ((lead & 0xF8) == 0xF0) need = 4;
     if (cut.size() - index < need) cut.truncate(index);
     return QString::fromUtf8(cut) + QStringLiteral("\n... [输出已截断]");
+}
+
+QString ShellConfig::shellProgram() const {
+    const QString trimmed = program.trimmed();
+    return trimmed.isEmpty() ? QStringLiteral("/bin/bash") : trimmed;
+}
+
+QString ShellConfig::wrapCommand(const QString& command) const {
+    const QString script = sourceScript.trimmed();
+    if (script.isEmpty()) {
+        return command;
+    }
+    // Single-quote the path so spaces/specials survive; embed '\'' for a quote.
+    QString quoted = script;
+    quoted.replace(QLatin1String("'"), QLatin1String("'\\''"));
+    return QStringLiteral(". '%1' || exit 125\n%2").arg(quoted, command);
 }
 
 void ToolBatch::begin(const QVector<ToolCallSpec>& calls) {

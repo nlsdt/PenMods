@@ -61,18 +61,24 @@ int main() {
     }
     CHECK_EQ(loaded->sessions.size(), std::size_t{1});
     CHECK_EQ(loaded->activeSessionId, QString("s1"));
+    auto loadedMessages = repo->loadMessages(QStringLiteral("s1"));
+    CHECK(loadedMessages.has_value());
     if (!loaded->sessions.empty()) {
         const auto& restored = loaded->sessions.front();
         CHECK_EQ(restored.id, QString("s1"));
         CHECK_EQ(restored.title, QString("Title"));
-        CHECK_EQ(restored.messages.size(), 3);
-        if (restored.messages.size() == 3) {
-            CHECK_EQ(restored.messages[0].messageId, QString("m1"));
-            CHECK_EQ(restored.messages[1].reasoning, QString("think"));
-            CHECK_EQ(restored.messages[1].toolCallsJson, assistant.toolCallsJson);
-            CHECK_EQ(restored.messages[1].toolStates.size(), 1);
-            CHECK_EQ(restored.messages[2].toolCallId, QString("c1"));
-            CHECK_EQ(restored.messages[2].content, QString("result"));
+        // load() is an overview: messages are decoded per session on demand.
+        CHECK_EQ(restored.messages.size(), 0);
+        CHECK_EQ(restored.messageCount, 3);
+        const auto& messages = *loadedMessages;
+        CHECK_EQ(messages.size(), 3);
+        if (messages.size() == 3) {
+            CHECK_EQ(messages[0].messageId, QString("m1"));
+            CHECK_EQ(messages[1].reasoning, QString("think"));
+            CHECK_EQ(messages[1].toolCallsJson, assistant.toolCallsJson);
+            CHECK_EQ(messages[1].toolStates.size(), 1);
+            CHECK_EQ(messages[2].toolCallId, QString("c1"));
+            CHECK_EQ(messages[2].content, QString("result"));
         }
     }
 
@@ -84,13 +90,16 @@ int main() {
 
     auto rewritten = repo->load();
     CHECK(rewritten.has_value());
-    if (rewritten && !rewritten->sessions.empty()) {
+    auto rewrittenMessages = repo->loadMessages(QStringLiteral("s1"));
+    CHECK(rewrittenMessages.has_value());
+    if (rewritten && !rewritten->sessions.empty() && rewrittenMessages) {
         const auto& restored = rewritten->sessions.front();
         CHECK_EQ(restored.title, QString("Renamed"));
-        CHECK_EQ(restored.messages.size(), 2);
-        if (restored.messages.size() == 2) {
-            CHECK_EQ(restored.messages[1].messageId, QString("m2b"));
-            CHECK_EQ(restored.messages[1].content, QString("edited answer"));
+        CHECK_EQ(restored.messageCount, 2);
+        CHECK_EQ(rewrittenMessages->size(), 2);
+        if (rewrittenMessages->size() == 2) {
+            CHECK_EQ((*rewrittenMessages)[1].messageId, QString("m2b"));
+            CHECK_EQ((*rewrittenMessages)[1].content, QString("edited answer"));
         }
     }
 
@@ -98,13 +107,13 @@ int main() {
     CHECK(repo->syncTail("s1", {makeMessage("m1", "user", "hi")}, 1, 2002).has_value());
     auto truncated = repo->load();
     if (truncated && !truncated->sessions.empty()) {
-        CHECK_EQ(truncated->sessions.front().messages.size(), 1);
+        CHECK_EQ(truncated->sessions.front().messageCount, 1);
     }
 
     CHECK(repo->clearMessages("s1", 2003).has_value());
     auto cleared = repo->load();
     if (cleared && !cleared->sessions.empty()) {
-        CHECK_EQ(cleared->sessions.front().messages.size(), 0);
+        CHECK_EQ(cleared->sessions.front().messageCount, 0);
     }
 
     CHECK(!repo->appendMessages("missing", {makeMessage("m4", "user", "x")}).has_value());

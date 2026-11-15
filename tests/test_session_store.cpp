@@ -94,6 +94,20 @@ int main() {
         CHECK_EQ(usageMeta->tokensCacheWrite, std::int64_t{1});
     }
 
+    // 会话账目：命中率/金额直接落在 sessions 行，统计跟随会话。
+    CHECK(store->addUsage("s1", UsageCounters{100, 20, 5, 60, 0, 0.00042}).has_value());
+    CHECK(store->addUsage("s1", UsageCounters{40, 10, 0, 0, 0, 0.0001}).has_value());
+    auto ledger = store->sessionUsage("s1");
+    CHECK(ledger.has_value());
+    if (ledger) {
+        CHECK_EQ(ledger->input, std::int64_t{155});
+        CHECK_EQ(ledger->output, std::int64_t{35});
+        CHECK_EQ(ledger->cacheRead, std::int64_t{63});
+        CHECK(ledger->cost > 0.00051 && ledger->cost < 0.00053);
+        CHECK(ledger->hitRate() > 40.0 && ledger->hitRate() < 41.0);
+    }
+    CHECK(!store->sessionUsage("missing").has_value());
+
     CHECK(store->renameSession("s1", "Renamed", 3000).has_value());
     auto renamed = store->getSession("s1");    CHECK(renamed.has_value());
     CHECK_EQ(renamed->title, std::string("Renamed"));

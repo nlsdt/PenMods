@@ -84,7 +84,11 @@ public:
     Q_INVOKABLE void    deleteMessage(int index);
     Q_INVOKABLE void    regenerateMessage(int index);
     Q_INVOKABLE void    cancelRequest();
-    Q_INVOKABLE void    resetApiCacheStats();
+    // 从 {endpoint}/models 的 pricing 字段刷新当前模型单价（美元/百万 tokens）。
+    Q_INVOKABLE void    refreshModelPrices();
+
+    // QML 侧的耗时打点：console.log 在设备上不落日志，统一由这里转到 applog。
+    Q_INVOKABLE void    reportPerf(const QString& name, int ms, int rows = 0);
 
     // Tool Call 接口
     Q_INVOKABLE void submitToolResult(const QString& toolCallId, const QString& toolName, const QString& result);
@@ -207,6 +211,7 @@ signals:
     void isStreamingChanged();
     void messagesChanged();
     void apiCacheStatsChanged();
+    void apiCacheStatsRefreshed();
     void modelsChanged();
     void promptsChanged();
     void sessionsChanged();

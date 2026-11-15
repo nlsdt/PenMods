@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS app_state (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 ) STRICT;
+
 )SQL");
 
         SQLite::Statement migration(*m_db, "INSERT OR IGNORE INTO migration(id, completed_at) VALUES(?, ?)");
@@ -380,17 +381,46 @@ Result<void> SessionStore::addUsage(const std::string& sessionId, const UsageCou
             *m_db,
             "UPDATE sessions SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ?, "
             "tokens_reasoning = tokens_reasoning + ?, tokens_cache_read = tokens_cache_read + ?, "
-            "tokens_cache_write = tokens_cache_write + ? WHERE id = ?");
+            "tokens_cache_write = tokens_cache_write + ?, cost = cost + ? WHERE id = ?");
         update.bind(1, usage.input);
         update.bind(2, usage.output);
         update.bind(3, usage.reasoning);
         update.bind(4, usage.cacheRead);
         update.bind(5, usage.cacheWrite);
-        update.bind(6, sessionId);
+        update.bind(6, usage.cost);
+        update.bind(7, sessionId);
         if (update.exec() == 0) {
             return fail(ErrorCode::NotFound, "session not found: " + sessionId);
         }
         return {};
+    } catch (const SQLite::Exception& e) {
+        return std::unexpected(sqliteError(ErrorCode::DatabaseQuery, e));
+    } catch (const std::exception& e) {
+        return fail(ErrorCode::DatabaseQuery, e.what());
+    }
+}
+
+Result<UsageStats> SessionStore::sessionUsage(const std::string& sessionId) const {
+    if (sessionId.empty()) {
+        return fail(ErrorCode::InvalidArgument, "session id is empty");
+    }
+    try {
+        SQLite::Statement query(
+            *m_db,
+            "SELECT tokens_in, tokens_out, tokens_reasoning, tokens_cache_read, tokens_cache_write, cost "
+            "FROM sessions WHERE id = ?");
+        query.bind(1, sessionId);
+        if (!query.executeStep()) {
+            return fail(ErrorCode::NotFound, "session not found: " + sessionId);
+        }
+        UsageStats stats;
+        stats.input      = query.getColumn(0).getInt64();
+        stats.output     = query.getColumn(1).getInt64();
+        stats.reasoning  = query.getColumn(2).getInt64();
+        stats.cacheRead  = query.getColumn(3).getInt64();
+        stats.cacheWrite = query.getColumn(4).getInt64();
+        stats.cost       = query.getColumn(5).getDouble();
+        return stats;
     } catch (const SQLite::Exception& e) {
         return std::unexpected(sqliteError(ErrorCode::DatabaseQuery, e));
     } catch (const std::exception& e) {

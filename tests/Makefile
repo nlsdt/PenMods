@@ -44,6 +44,7 @@ MODULES := \
 	model/ModelRegistry.cpp \
 	model/PromptStore.cpp \
 	tools/ToolRuntime.cpp \
+	tools/ReadTool.cpp \
 	tools/ShellTool.cpp \
 	tools/WebSearchTool.cpp \
 	engine/ChatEngine.cpp \
@@ -61,7 +62,7 @@ SQLITECPP_LIB  := $(BUILD)/libsqlitecpp.a
 TESTS ?= test_request_log test_history_trim test_message_json test_request_sequence \
          test_protocol test_context test_models test_tools test_shell_tool \
          test_search_tool test_chat_engine test_session_store \
-         test_session_repository test_session_manager
+         test_session_repository test_session_manager test_read_tool
 
 BINS := $(addprefix $(BUILD)/,$(TESTS))
 
@@ -76,6 +77,7 @@ test_context_OBJS            := $(OBJ)/context/ContextAssembler.o $(OBJ)/context
 test_models_OBJS             := $(OBJ)/model/ModelRegistry.o $(OBJ)/model/PromptStore.o
 test_tools_OBJS              := $(OBJ)/tools/ToolRuntime.o $(OBJ)/context/ContextAssembler.o \
                                 $(OBJ)/context/HistoryTrimmer.o
+test_read_tool_OBJS          := $(OBJ)/tools/ReadTool.o
 test_shell_tool_OBJS         := $(OBJ)/tools/ShellTool.o $(OBJ)/tools/ToolRuntime.o \
                                 $(OBJ)/context/ContextAssembler.o $(OBJ)/context/HistoryTrimmer.o
 test_search_tool_OBJS        := $(OBJ)/tools/WebSearchTool.o

@@ -83,6 +83,25 @@ struct UsageCounters {
     std::int64_t reasoning = 0;
     std::int64_t cacheRead = 0;
     std::int64_t cacheWrite = 0;
+    // 这一请求按**请求发生时的模型单价**折算的金额（元）。固化进 usage_records，
+    // 之后改价不会回头改写历史账目。
+    double       cost = 0;
+};
+
+// 一个会话已持久化的用量账目，直接来自 sessions 行（tokens_* / cost）。
+// 命中率 = cacheRead / input；input 已含缓存命中部分（见 parseUsageObject 的口径），
+// 所以界面口径与厂商一致，且重启、切会话都不会丢。
+struct UsageStats {
+    std::int64_t input = 0;
+    std::int64_t output = 0;
+    std::int64_t reasoning = 0;
+    std::int64_t cacheRead = 0;
+    std::int64_t cacheWrite = 0;
+    double       cost = 0;
+
+    [[nodiscard]] double hitRate() const {
+        return input > 0 ? 100.0 * static_cast<double>(cacheRead) / static_cast<double>(input) : 0.0;
+    }
 };
 
 struct SessionMeta {

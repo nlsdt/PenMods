@@ -10,8 +10,10 @@
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QFile>
 #include <QString>
 #include <QStringList>
+#include <QTemporaryDir>
 #include <QThread>
 
 #include <functional>
@@ -58,6 +60,32 @@ int main(int argc, char** argv) {
         CHECK(result.contains(QStringLiteral("stderr:\nerr\n")));
         CHECK(formatShellResult(0, true, "", "", config).contains(QStringLiteral("进程崩溃")));
         CHECK(formatShellTimeout(1200, "o", "e", config).startsWith(QStringLiteral("命令超时（1200ms）。")));
+    }
+
+    // ------------------------------------ configurable program / source hook
+    {
+        ShellConfig config = ShellConfig::defaultConfig();
+        CHECK_EQ(config.shellProgram(), QStringLiteral("/bin/bash"));
+        CHECK_EQ(config.wrapCommand(QStringLiteral("echo hi")), QStringLiteral("echo hi"));
+
+        config.program      = QStringLiteral("/bin/bash");
+        config.sourceScript = QStringLiteral("/tmp/my env.sh");
+        config.runAs        = QStringLiteral("agent");
+        CHECK_EQ(config.shellProgram(), QStringLiteral("/bin/bash"));
+        const QString wrapped = config.wrapCommand(QStringLiteral("echo hi"));
+        CHECK(wrapped.contains(QStringLiteral(". '/tmp/my env.sh' || exit 125")));
+        CHECK(wrapped.endsWith(QStringLiteral("echo hi")));
+
+        const ShellConfig roundTrip = ShellConfig::fromJson(config.toJson());
+        CHECK_EQ(roundTrip.program, QStringLiteral("/bin/bash"));
+        CHECK_EQ(roundTrip.sourceScript, QStringLiteral("/tmp/my env.sh"));
+        CHECK_EQ(roundTrip.runAs, QStringLiteral("agent"));
+
+        ShellConfig odd = ShellConfig::defaultConfig();
+        odd.program.clear();
+        CHECK_EQ(odd.shellProgram(), QStringLiteral("/bin/bash"));
+        odd.sourceScript = QStringLiteral("/tmp/it's.sh");
+        CHECK(odd.wrapCommand(QStringLiteral("true")).contains(QStringLiteral(". '/tmp/it'\\''s.sh'")));
     }
 
     ShellTool  tool;
@@ -117,6 +145,47 @@ int main(int argc, char** argv) {
         // Approving an unknown / already finished id is a no-op.
         tool.approve(QStringLiteral("c1"));
         CHECK_EQ(starts.size(), 1);
+    }
+
+    // ------------------------------------------- LD_* never leaks to the tool
+    {
+        qputenv("LD_PRELOAD", QByteArray("/nonexistent/preload.so"));
+        finished.clear();
+        CHECK(!tool.request(QStringLiteral("c-env"), QStringLiteral("echo \"preload=${LD_PRELOAD:-clean}\"")).has_value());
+        tool.approve(QStringLiteral("c-env"));
+        CHECK(waitFor([&]() { return !finished.isEmpty(); }));
+        if (!finished.isEmpty()) {
+            CHECK(finished[0].success);
+            CHECK(finished[0].result.contains(QStringLiteral("preload=clean")));
+        }
+        qunsetenv("LD_PRELOAD");
+        tool.setConfig(enabledConfig());
+    }
+
+    // ------------------------------------------- sourced prelude takes effect
+    {
+        QTemporaryDir dir;
+        CHECK(dir.isValid());
+        const QString scriptPath = dir.filePath(QStringLiteral("env.sh"));
+        QFile         script(scriptPath);
+        CHECK(script.open(QIODevice::WriteOnly));
+        script.write("PM_SOURCE_TEST=42\nexport PM_SOURCE_TEST\n");
+        script.close();
+
+        ShellConfig sourced  = enabledConfig();
+        sourced.program      = QStringLiteral("/bin/bash");
+        sourced.sourceScript = scriptPath;
+        tool.setConfig(sourced);
+
+        finished.clear();
+        CHECK(!tool.request(QStringLiteral("c-src"), QStringLiteral("echo \"v=$PM_SOURCE_TEST\"")).has_value());
+        tool.approve(QStringLiteral("c-src"));
+        CHECK(waitFor([&]() { return !finished.isEmpty(); }));
+        if (!finished.isEmpty()) {
+            CHECK(finished[0].success);
+            CHECK(finished[0].result.contains(QStringLiteral("v=42")));
+        }
+        tool.setConfig(enabledConfig());
     }
 
     // ----------------------------------------------------------- deny

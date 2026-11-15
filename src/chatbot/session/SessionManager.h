@@ -9,6 +9,7 @@
 #include "SessionRepository.h"
 
 #include <QMap>
+#include <QSet>
 #include <QString>
 #include <QVector>
 
@@ -31,7 +32,11 @@ public:
     [[nodiscard]] QString                             activeSessionId() const { return m_activeSessionId; }
     [[nodiscard]] bool                                hasSession(const QString& id) const;
     [[nodiscard]] const StoredSession*                session(const QString& id) const;
-    [[nodiscard]] QVector<MessageData>                messages(const QString& id) const;
+    // Conversation text is loaded on demand: only the sessions the user opened
+    // have their messages in memory. messages() loads and caches on first use.
+    [[nodiscard]] QVector<MessageData>                messages(const QString& id);
+    [[nodiscard]] bool                                isLoaded(const QString& id) const;
+    [[nodiscard]] Result<void>                        ensureLoaded(const QString& id);
 
     [[nodiscard]] Result<QString> createSession(const QString& title = {});
     [[nodiscard]] Result<void>    deleteSession(const QString& id);
@@ -49,7 +54,11 @@ public:
     [[nodiscard]] Result<void> clearMessages(const QString& sessionId);
     // Adds one request's token usage to the persisted session counters. Purely a
     // write-through to SQLite; nothing in StoredSession mirrors these totals.
-    [[nodiscard]] Result<void> recordUsage(const QString& sessionId, const UsageCounters& usage);
+    // 把一次请求的用量累加到会话账目（含金额），统计跟随会话。
+    [[nodiscard]] Result<void> addUsage(const QString& sessionId, const UsageCounters& usage);
+
+    // 会话的持久化用量账目（命中率、tokens、金额）。
+    [[nodiscard]] Result<UsageStats> sessionUsage(const QString& sessionId) const;
 
     // Internal: prefer open(). Public only so std::make_unique can construct it.
     SessionManager(std::unique_ptr<SessionRepository> repo, LoadedSessions loaded);
@@ -60,6 +69,7 @@ private:
 
     std::unique_ptr<SessionRepository> m_repo;
     QMap<QString, StoredSession>       m_sessions;
+    QSet<QString>                      m_loaded;
     QString                            m_activeSessionId;
 };
 

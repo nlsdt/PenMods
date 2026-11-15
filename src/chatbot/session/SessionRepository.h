@@ -25,6 +25,7 @@ struct StoredSession {
     QString              title;
     QString              createdAt;
     QString              updatedAt;
+    int                  messageCount = 0; // from the sessions row; messages may be unloaded
     QVector<MessageData> messages;
 };
 
@@ -43,7 +44,13 @@ public:
 
     [[nodiscard]] static Result<std::unique_ptr<SessionRepository>> open(const QString& dbPath);
 
+    // Loads the session list only; messages are fetched per session with
+    // loadMessages(). Startup therefore never touches conversations the user
+    // has not opened.
     [[nodiscard]] Result<LoadedSessions> load() const;
+
+    // Full message list of one session, decoded from the event log.
+    [[nodiscard]] Result<QVector<MessageData>> loadMessages(const QString& sessionId) const;
 
     [[nodiscard]] Result<void> createSession(
         const QString& id,
@@ -75,6 +82,8 @@ public:
     // Accumulates one request's token usage into the session row (see
     // SessionStore::addUsage). Missing sessions yield NotFound; zero usage is a no-op.
     [[nodiscard]] Result<void> addUsage(const QString& sessionId, const UsageCounters& usage);
+
+    [[nodiscard]] Result<UsageStats> sessionUsage(const QString& sessionId) const;
 
 private:
     std::unique_ptr<SessionStore> m_store;

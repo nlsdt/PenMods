@@ -96,6 +96,23 @@ int main() {
     CHECK_EQ(second->messages(workId).size(), 1);
     CHECK_EQ(second->messages(workId)[0].content, QString("hi edited"));
 
+    // Lazy loading: only the active conversation is decoded at startup; the
+    // untouched one has no message text in memory until it is opened.
+    CHECK(second->isLoaded(workId));
+    CHECK(!second->isLoaded(firstId));
+    CHECK(second->session(firstId) != nullptr);
+    CHECK(second->session(firstId)->messages.isEmpty());
+    CHECK_EQ(second->session(firstId)->messageCount, 0);
+
+    // Switching away releases the previous conversation, switching back
+    // re-decodes it from the event log.
+    CHECK(second->switchSession(firstId).has_value());
+    CHECK(second->isLoaded(firstId));
+    CHECK(!second->isLoaded(workId));
+    CHECK(second->session(workId)->messages.isEmpty());
+    CHECK_EQ(second->messages(workId).size(), 1);
+    CHECK(second->isLoaded(workId));
+
     CHECK(second->deleteSession(workId).has_value());
     CHECK_EQ(second->sessions().size(), 1);
     CHECK(second->activeSessionId() != workId);
