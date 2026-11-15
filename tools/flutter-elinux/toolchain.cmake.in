@@ -1,0 +1,20 @@
+# 由 scripts/env.sh 引入的变量构造出的交叉编译工具链文件。
+# 直接给 cmake -DCMAKE_TOOLCHAIN_FILE=... 使用，注意需要先 source env.sh，
+# 因为下面的占位符由 setup_sysroot.sh 生成实际文件时替换。
+
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+# zig cc/c++ 包装脚本由 setup_sysroot.sh 生成（负责注入 -target）
+set(CMAKE_C_COMPILER @WORK@/tc/zig-c)
+set(CMAKE_CXX_COMPILER @WORK@/tc/zig-cxx)
+
+# 只用自备的 sysinclude；绝不能把 /usr/include 整个加进来，否则宿主的 glibc 头
+# 会压过 zig 的 2.27 头（典型报错：__float128 is not supported on this target）
+set(CMAKE_C_FLAGS_INIT "-I@SYSINC@")
+set(CMAKE_CXX_FLAGS_INIT "-I@SYSINC@")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "-L@LIBS@ -Wl,-rpath-link,@LIBS@")
+
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

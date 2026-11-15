@@ -1,0 +1,16 @@
+--- a/flutter_elinux.h
++++ b/flutter_elinux.h
+@@ -83,11 +83,11 @@
+   int height;
+ 
+   // View rotation setting.
+-  FlutterDesktopViewRotation view_rotation;
++  enum FlutterDesktopViewRotation view_rotation;
+ 
+   // View display mode. If you set kFullscreen, the parameters of both `width`
+   // and `height` will be ignored.
+-  FlutterDesktopViewMode view_mode;
++  enum FlutterDesktopViewMode view_mode;
+ 
+   // View title.
+   const char* title;

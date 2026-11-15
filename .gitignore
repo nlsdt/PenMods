@@ -10,3 +10,6 @@ mathjax-server/package-lock.json
 /tools/ppocr-backend/build/
 /tools/ppocr-backend/vendor/
 /tools/ppocr-backend/dist/
+
+# 会话内临时目录（交叉编译中间产物等）
+.tmp/
