@@ -58,13 +58,18 @@ static void button(int down) {
     emit(EV_SYN, SYN_REPORT, 0);
 }
 
+// 面板尺寸按机型不同（YDP02X 170x320，YDP03X 480x800），逻辑坐标是旋转后的
+// 宽 x 高。默认保持二代尺寸，用 INJECTOR_PANEL=480x800 切到三代。
+static int g_panel_w = 170;
+static int g_panel_h = 320;
+
 static void convert(int ux, int uy, int lefthand, int* raw_x, int* raw_y) {
     if (lefthand) {
-        ux = 319 - ux;
-        uy = 169 - uy;
+        ux = (g_panel_w - 1) - ux;
+        uy = (g_panel_h - 1) - uy;
     }
     *raw_x = uy;
-    *raw_y = 319 - ux;
+    *raw_y = (g_panel_h - 1) - ux;
 }
 
 static int open_keyboard(void) {
@@ -80,6 +85,8 @@ static int open_keyboard(void) {
     ioctl(g_fd, UI_SET_KEYBIT, KEY_DOT);
     ioctl(g_fd, UI_SET_KEYBIT, KEY_COMMA);
     ioctl(g_fd, UI_SET_KEYBIT, KEY_MINUS);
+    ioctl(g_fd, UI_SET_KEYBIT, KEY_SLASH);
+    ioctl(g_fd, UI_SET_KEYBIT, KEY_EQUAL);
     ioctl(g_fd, UI_SET_KEYBIT, KEY_ENTER);
     ioctl(g_fd, UI_SET_KEYBIT, KEY_BACKSPACE);
 
@@ -111,6 +118,8 @@ static int key_code_for(char c) {
     if (c == '.') return KEY_DOT;
     if (c == ',') return KEY_COMMA;
     if (c == '-') return KEY_MINUS;
+    if (c == '/') return KEY_SLASH;
+    if (c == '=') return KEY_EQUAL;
     return -1;
 }
 
@@ -134,9 +143,9 @@ static int open_device(void) {
     udev.id.product = 0x5678;
     udev.id.version = 1;
     udev.absmin[ABS_X] = 0;
-    udev.absmax[ABS_X] = 170;
+    udev.absmax[ABS_X] = g_panel_w - 1;
     udev.absmin[ABS_Y] = 0;
-    udev.absmax[ABS_Y] = 320;
+    udev.absmax[ABS_Y] = g_panel_h - 1;
     if (write(g_fd, &udev, sizeof(udev)) != (ssize_t)sizeof(udev)) {
         perror("write uinput_user_dev");
         return -1;
@@ -149,7 +158,18 @@ static int open_device(void) {
     return 0;
 }
 
+static void read_panel_env(void) {
+    const char* panel = getenv("INJECTOR_PANEL");
+    if (!panel) return;
+    int w = 0, h = 0;
+    if (sscanf(panel, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+        g_panel_w = w;
+        g_panel_h = h;
+    }
+}
+
 int main(int argc, char** argv) {
+    read_panel_env();
     if (argc < 3) {
         fprintf(stderr, "usage: %s tap|longtap|swipe|flicktap|hold|press|release ui args... [--lefthand]\n"
                         "       %s type \"<ascii text>\" | bksp <n>\n", argv[0], argv[0]);
